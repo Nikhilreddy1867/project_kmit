@@ -39,6 +39,7 @@ PAGES = [
     "Explainability",
     "Governance Decision & Risks",
     "Agent Review",
+    "Model Registry",
 ]
 
 
@@ -240,6 +241,42 @@ def test_agent_review_page_reports_unavailable_evidence() -> None:
     text = _all_text(at)
     assert "evidence unavailable" in text.lower()
     assert "rather than estimating anything" in text.lower()
+
+
+def test_model_registry_page_renders_run_metadata_and_integrity() -> None:
+    at = _run("Model Registry")
+    assert not at.exception
+    text = _all_text(at)
+
+    # The registry must state that it does not make decisions.
+    assert "records evidence; it does not make decisions" in text.lower()
+
+    labels = [m.label for m in at.metric]
+    for expected in ("Registered runs", "Active run", "Artefacts", "Checked", "✅ Verified"):
+        assert expected in labels, f"missing metric: {expected}"
+
+    # Coverage across all five phases is displayed.
+    for phase in ("Performance", "Fairness", "Explainability", "Governance", "Agents"):
+        assert phase in labels, f"coverage metric missing: {phase}"
+
+    # Integrity result, digests and the recorded decision.
+    assert "integrity:" in text.lower()
+    assert "registered digest" in text.lower()
+    assert "evidence digest" in text.lower()
+    assert "Blocked from real-world deployment" in text
+    assert at.selectbox("registry_run").value
+
+
+def test_model_registry_page_shows_timeline_and_verified_status() -> None:
+    at = _run("Model Registry")
+    text = _all_text(at)
+    # Timeline events from both sources.
+    assert "run_registered" in text
+    assert "evidence_produced:" in text
+    assert "not a signed provenance record" in text
+    # With untouched evidence the run must verify.
+    assert "verified" in text.lower()
+    assert "does not establish" in text.lower()
 
 
 def test_unreachable_api_degrades_gracefully() -> None:

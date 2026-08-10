@@ -239,3 +239,32 @@ class GovernanceApiClient:
             ("agents", "findings_total", "preserved_decision", "overall_recommendation"),
             "GET /api/agents/review",
         )
+
+    # -- Phase 8: governance audit registry --------------------------------- #
+    def registry_runs(self, status: str | None = None) -> dict[str, Any]:
+        return self._require(
+            self._get("/api/registry/runs", {"status": status}),
+            ("count", "runs", "database"),
+            "GET /api/registry/runs",
+        )
+
+    def registry_run(self, run_id: str) -> dict[str, Any]:
+        return self._require(
+            self._get(f"/api/registry/runs/{run_id}"),
+            ("run_id", "status", "audit_coverage", "artifacts"),
+            f"GET /api/registry/runs/{run_id}",
+        )
+
+    def registry_integrity(self, run_id: str) -> dict[str, Any]:
+        return self._require(
+            self._get(f"/api/registry/runs/{run_id}/integrity"),
+            ("integrity_status", "integrity_ok", "artifacts_checked"),
+            f"GET /api/registry/runs/{run_id}/integrity",
+        )
+
+    def registry_timeline(self, run_id: str) -> dict[str, Any]:
+        return self._require(
+            self._get(f"/api/registry/runs/{run_id}/timeline"),
+            ("run_id", "events", "count"),
+            f"GET /api/registry/runs/{run_id}/timeline",
+        )

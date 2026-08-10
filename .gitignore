@@ -19,6 +19,11 @@ models/random_forest_pipeline.joblib
 # Local server logs (uvicorn / streamlit run output)
 *.log
 
+# Local runtime state: the Phase 8 governance registry SQLite database.
+# Rebuild it from the committed evidence with:
+#     python -m app.registry.cli register
+runtime/
+
 # OS / editor cruft
 Thumbs.db
 ehthumbs.db

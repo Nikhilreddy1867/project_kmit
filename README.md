@@ -475,6 +475,153 @@ exactly** (`==`, not approximate), that the decision is preserved field for fiel
 that output is deterministic across runs, and that running the agents modifies no
 artefact.
 
+## 3d. Governance audit registry (Phase 8)
+
+A local **SQLite-backed audit registry** that records the current audit as one
+governance review run, with SHA-256 checksums of every referenced artefact, so the
+evidence a conclusion rests on can be verified later.
+
+The registry **records evidence; it does not make decisions.** The governance
+decision stored on a run is a copy of the committed decision record.
+
+### Where it lives
+
+```text
+runtime/governance_registry.db      # gitignored local state
+```
+
+Rebuild it at any time from the committed evidence — nothing is lost by deleting it.
+
+### Create or refresh the registry (Windows)
+
+```powershell
+cd C:\Users\nreddy\Downloads\project_KMIT
+.\.venv\Scripts\Activate.ps1
+
+# Create or refresh the current audit-run record. Idempotent.
+python -m app.registry.cli register
+
+# List registered runs
+python -m app.registry.cli list
+
+# Verify the active run's checksums (exit code 0 = verified, 2 = integrity broken)
+python -m app.registry.cli integrity
+```
+
+Without activating the venv, prefix with `.\.venv\Scripts\python.exe -m ...`.
+
+To use a different database location:
+
+```powershell
+python -m app.registry.cli register --db C:\temp\my_registry.db
+# or
+$env:GOVERNANCE_REGISTRY_DB = "C:\temp\my_registry.db"
+```
+
+### Why `register` is idempotent
+
+A run's id is **content-addressed**: it is derived from an *evidence digest*, which
+is a SHA-256 over the sorted `path:sha256` pairs of every registered artefact, plus
+the dataset and subject-model identity.
+
+- **Evidence unchanged** → same run id → the existing row is **refreshed in place**.
+  `created_at` is preserved; `refreshed_at` and `refresh_count` advance. No duplicate.
+- **Any artefact changed** → different digest → **new run** is created and the
+  previously active run is marked `superseded`. History is never rewritten.
+
+The model version is itself content-based (`sha256:` of the fitted pipeline), so it
+changes if and only if the serialised model changes — no version numbers to forget
+to bump.
+
+### What a run stores
+
+| Field | Source |
+|---|---|
+| `run_id` | content-addressed from the evidence digest |
+| `created_at` / `refreshed_at` / `refresh_count` | registry |
+| `dataset_name` / `dataset_version` / `dataset_context` | UCI Adult id 2, 1994 census context |
+| `model_name` / `model_version` / `model_run_identifier` | `sha256:` of the pipeline + split/threshold params |
+| `artifacts[]` | path, group, **SHA-256**, size, mtime for each of ~34 artefacts |
+| `evidence_digest` | SHA-256 over the whole artefact set |
+| `performance_summary` | quoted verbatim from the Phase 1 audit |
+| `governance_decision` / `blocking_risk_ids` | copied from the committed decision record |
+| `audit_coverage` | performance, fairness, explainability, governance, agents |
+| `status` | `active`, `superseded` or `archived` |
+
+### Endpoints
+
+| Endpoint | Returns |
+|---|---|
+| `/api/registry/runs` | All runs, newest first. Optional `?status=active` |
+| `/api/registry/runs/{run_id}` | Full run detail + artefact manifest |
+| `/api/registry/runs/{run_id}/integrity` | **Recomputes** every checksum: verified / missing / changed + overall status |
+| `/api/registry/runs/{run_id}/timeline` | Registry events + evidence events. Optional `?limit=N` |
+
+Creating or refreshing a run is a deliberate **CLI action**, not an HTTP call, so
+the API surface stays read-only. Before the registry exists these endpoints return
+**503** with the exact command to run — never an empty list, which would read as
+"this audit was never registered".
+
+### Integrity semantics
+
+| Status | Meaning |
+|---|---|
+| `verified` | Every artefact still hashes to its registered value |
+| `incomplete` | Some registered artefacts are gone; none altered |
+| `modified` | Some artefacts were altered |
+| `modified_and_incomplete` | Both |
+
+`integrity_ok` is true only for `verified`. Two deliberate design points:
+
+- **mtime is excluded from the digest**, so touching a file without changing its
+  bytes does not break integrity.
+- **`changed` is not an accusation.** Re-running an audit script legitimately
+  rewrites its outputs. It means this run's conclusions no longer describe the files
+  on disk, so a new run should be registered. Checksums detect modification, not
+  authorship — this is a local integrity check, not a signed provenance chain.
+
+### Dashboard
+
+Open **http://localhost:8501** → **Model Registry** for the run list, selected-run
+metadata, recorded decision, evidence coverage, live integrity status and timeline.
+
+### Test
+
+```powershell
+pytest tests\test_registry.py -q     # 22 tests, no server needed
+```
+
+Includes a **deliberate integrity mismatch**: artefacts are copied into a temp
+directory, one is modified and one deleted, and verification is run against those
+copies — real files, real SHA-256 recomputation, and the repository's evidence is
+never touched. A final test asserts the real artefacts are byte-identical after the
+whole module has run.
+
+### Architecture addition
+
+```text
+   ┌──────────────────────────────────────────────┐
+   │  IMMUTABLE EVIDENCE (read-only)              │
+   │  data/ · models/ · predictions/ · results/   │
+   └───────────────┬──────────────────────────────┘
+                   │ SHA-256 (read-only)
+                   ▼
+   ┌──────────────────────────────────────────────┐
+   │  PHASE 8 — registry (app/registry/)          │
+   │  integrity.py  discovery + SHA-256           │
+   │  db.py         SQLite (the ONLY writer)      │
+   │  service.py    register / read / verify      │
+   │  cli.py        python -m app.registry.cli    │
+   │                                              │
+   │  writes ONLY to runtime/*.db                 │
+   └───────────────┬──────────────────────────────┘
+                   │ read-only HTTP
+                   ▼
+        /api/registry/runs[...]  →  dashboard "Model Registry"
+```
+
+---
+
 ### Note on `/api/agents/review` route order
 
 `/api/agents/review` is declared **before** `/api/agents/{agent_name}` in

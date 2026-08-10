@@ -51,6 +51,7 @@ PAGES = [
     "Explainability",
     "Governance Decision & Risks",
     "Agent Review",
+    "Model Registry",
 ]
 
 st.set_page_config(
@@ -171,6 +172,28 @@ def fetch_agents(base_url: str) -> dict[str, Any]:
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_agent_review(base_url: str, model: str) -> dict[str, Any]:
     return GovernanceApiClient(base_url).agent_review(model)
+
+
+# Registry fetches use a short TTL: integrity is a live check, so a stale cached
+# "verified" would be actively misleading.
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_registry_runs(base_url: str, status: str | None = None) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).registry_runs(status=status)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_registry_run(base_url: str, run_id: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).registry_run(run_id)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_registry_integrity(base_url: str, run_id: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).registry_integrity(run_id)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_registry_timeline(base_url: str, run_id: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).registry_timeline(run_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -1255,6 +1278,280 @@ def page_agent_review(base_url: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Page 7 — Model Registry
+# --------------------------------------------------------------------------- #
+INTEGRITY_STYLE = {
+    "verified": ("✅", "success"),
+    "incomplete": ("⚠️", "warning"),
+    "modified": ("🔴", "error"),
+    "modified_and_incomplete": ("🔴", "error"),
+}
+
+RUN_STATUS_STYLE = {"active": "🟢", "superseded": "🟡", "archived": "⚪"}
+
+
+def page_model_registry(base_url: str) -> None:
+    st.title("Model registry")
+    st.caption(
+        "Each governance review run is recorded with SHA-256 checksums of every "
+        "referenced artefact, so the evidence a conclusion rests on can be verified "
+        "later."
+    )
+    st.info(
+        "**The registry records evidence; it does not make decisions.** The governance "
+        "decision shown on a run is a copy of the committed decision record.",
+        icon="📒",
+    )
+
+    # --- run list ---------------------------------------------------------- #
+    try:
+        listing = fetch_registry_runs(base_url)
+    except ApiServerError as exc:
+        # A 503 here means the registry has not been created yet -- an actionable
+        # setup step, so show the exact command rather than a generic error.
+        if exc.status_code == 503:
+            st.warning(
+                "**The registry has not been created yet.** Create it from the "
+                "existing evidence (this reads the artefacts and writes only to "
+                "`runtime/`):",
+                icon="📒",
+            )
+            st.code(
+                "cd C:\\Users\\nreddy\\Downloads\\project_KMIT\n"
+                ".\\.venv\\Scripts\\Activate.ps1\n"
+                "python -m app.registry.cli register",
+                language="powershell",
+            )
+            st.caption(f"API said: {exc.message}")
+            render_provenance(base_url)
+            return
+        show_api_error(exc, "Registry")
+        return
+    except ApiError as exc:
+        show_api_error(exc, "Registry")
+        return
+
+    runs = listing.get("runs") or []
+    if not runs:
+        st.warning(
+            "The registry exists but holds no runs. Run "
+            "`python -m app.registry.cli register`.",
+            icon="📭",
+        )
+        render_provenance(base_url)
+        return
+
+    st.subheader("Audit runs")
+    cols = st.columns(3)
+    cols[0].metric("Registered runs", _fmt(listing.get("count")))
+    cols[1].metric("Active run", listing.get("active_run_id") or "none")
+    cols[2].metric("Database", str(listing.get("database")))
+    st.dataframe(runs, width="stretch", hide_index=True)
+
+    labels = [
+        f"{RUN_STATUS_STYLE.get(str(r.get('status')), '•')} {r.get('run_id')} "
+        f"({r.get('status')}) · {r.get('created_at')}"
+        for r in runs
+    ]
+    choice = st.selectbox("Selected run", labels, index=0, key="registry_run")
+    run_id = str(runs[labels.index(choice)].get("run_id"))
+
+    # --- run metadata ------------------------------------------------------- #
+    try:
+        run = fetch_registry_run(base_url, run_id)
+    except ApiError as exc:
+        show_api_error(exc, f"Run {run_id}")
+        return
+
+    st.divider()
+    st.subheader("Run metadata")
+    cols = st.columns(4)
+    cols[0].metric("Status", f"{RUN_STATUS_STYLE.get(str(run.get('status')), '')} "
+                             f"{run.get('status')}")
+    cols[1].metric("Artefacts", _fmt(run.get("artifact_count")))
+    cols[2].metric("Refreshes", _fmt(run.get("refresh_count")))
+    cols[3].metric("Schema", f"v{run.get('schema_version')}")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Dataset**")
+        st.markdown(f"- Name: `{run.get('dataset_name')}`")
+        st.markdown(f"- Version: `{run.get('dataset_version')}`")
+        st.caption(run.get("dataset_context", ""))
+    with right:
+        st.markdown("**Model**")
+        st.markdown(f"- Name: `{run.get('model_name')}`")
+        st.markdown(f"- Version: `{run.get('model_version')}`")
+        st.caption(f"Run identifier: {run.get('model_run_identifier')}")
+
+    st.markdown("**Registry identity**")
+    st.markdown(f"- Run id: `{run.get('run_id')}` (content-addressed)")
+    st.markdown(f"- Evidence digest: `{run.get('evidence_digest')}`")
+    st.caption(
+        f"Created {run.get('created_at')} · last refreshed {run.get('refreshed_at')}. "
+        "The run id is derived from the evidence digest, so re-registering unchanged "
+        "evidence refreshes this same run instead of creating a duplicate."
+    )
+
+    # --- recorded decision -------------------------------------------------- #
+    st.divider()
+    st.subheader("Governance decision (as recorded)")
+    decision = run.get("governance_decision") or {}
+    render_decision_banner(
+        {
+            "research_use": decision.get("research_use"),
+            "real_world_deployment": decision.get("real_world_deployment"),
+            "disclaimer": decision.get("note"),
+        }
+    )
+    st.markdown(f"**{decision.get('headline', '')}**")
+    st.caption(
+        f"Recorded {decision.get('decision_date')} · source `{decision.get('source')}`"
+    )
+    if run.get("blocking_risk_ids"):
+        st.caption(
+            "Blocking risks recorded on this run: "
+            + ", ".join(f"`{r}`" for r in run["blocking_risk_ids"])
+        )
+
+    # --- evidence coverage -------------------------------------------------- #
+    st.divider()
+    st.subheader("Evidence coverage")
+    coverage = run.get("audit_coverage") or {}
+    phases = ("performance", "fairness", "explainability", "governance", "agents")
+    cols = st.columns(len(phases) + 1)
+    for col, phase in zip(cols, phases):
+        covered = bool(coverage.get(phase))
+        col.metric(phase.capitalize(), "✅ yes" if covered else "❌ no")
+    cols[-1].metric("Complete", "✅ yes" if coverage.get("complete") else "❌ no")
+
+    detail_l, detail_r = st.columns(2)
+    with detail_l:
+        st.caption(
+            "Models evaluated: "
+            + ", ".join(f"`{m}`" for m in coverage.get("models_evaluated") or [])
+        )
+        st.caption(
+            "With explainability: "
+            + ", ".join(f"`{m}`" for m in coverage.get("models_with_explainability") or [])
+        )
+    with detail_r:
+        st.caption(
+            "Sensitive attributes audited: "
+            + ", ".join(f"`{a}`" for a in coverage.get("sensitive_attributes") or [])
+        )
+        st.caption(
+            "Agents: " + ", ".join(f"`{a}`" for a in coverage.get("agent_names") or [])
+        )
+
+    # --- artefact integrity ------------------------------------------------- #
+    st.divider()
+    st.subheader("Artefact integrity")
+    st.caption(
+        "Recomputes the SHA-256 of every registered artefact right now and compares "
+        "it with the checksum captured at registration time."
+    )
+    try:
+        integrity = fetch_registry_integrity(base_url, run_id)
+    except ApiError as exc:
+        show_api_error(exc, "Integrity check")
+        render_provenance(base_url)
+        return
+
+    status = str(integrity.get("integrity_status"))
+    icon, kind = INTEGRITY_STYLE.get(status, ("❔", "warning"))
+    banner = getattr(st, kind)
+    banner(
+        f"**{icon} Integrity: {status.replace('_', ' ').upper()}** — "
+        f"{integrity.get('verified_count')} verified, "
+        f"{integrity.get('changed_count')} changed, "
+        f"{integrity.get('missing_count')} missing "
+        f"of {integrity.get('artifacts_checked')} artefacts.",
+        icon=icon,
+    )
+
+    cols = st.columns(4)
+    cols[0].metric("Checked", _fmt(integrity.get("artifacts_checked")))
+    cols[1].metric("✅ Verified", _fmt(integrity.get("verified_count")))
+    cols[2].metric("🔴 Changed", _fmt(integrity.get("changed_count")))
+    cols[3].metric("⚠️ Missing", _fmt(integrity.get("missing_count")))
+
+    counts = {
+        "verified": integrity.get("verified_count") or 0,
+        "changed": integrity.get("changed_count") or 0,
+        "missing": integrity.get("missing_count") or 0,
+    }
+    fig = go.Figure(
+        go.Bar(
+            x=list(counts.keys()),
+            y=list(counts.values()),
+            marker_color=[C_FPR, C_THRESHOLD, "#eda100"],
+            text=[str(v) for v in counts.values()],
+            textposition="outside",
+            hovertemplate="%{x}: %{y} artefact(s)<extra></extra>",
+        )
+    )
+    st.plotly_chart(_style(fig, height=300, y_title="Artefacts"), width="stretch")
+
+    digest_match = integrity.get("registered_evidence_digest") == integrity.get(
+        "current_evidence_digest"
+    )
+    st.markdown(
+        f"- Registered digest: `{integrity.get('registered_evidence_digest')}`\n"
+        f"- Current digest:    `{integrity.get('current_evidence_digest')}`\n"
+        f"- Match: {'✅ yes' if digest_match else '🔴 no'}"
+    )
+
+    if integrity.get("changed_files"):
+        st.error(
+            "**Changed since registration:** "
+            + ", ".join(f"`{p}`" for p in integrity["changed_files"]),
+            icon="🔴",
+        )
+    if integrity.get("missing_files"):
+        st.warning(
+            "**Missing:** " + ", ".join(f"`{p}`" for p in integrity["missing_files"]),
+            icon="⚠️",
+        )
+
+    with st.expander("Per-artefact detail", expanded=False):
+        st.dataframe(integrity.get("artifacts") or [], width="stretch", hide_index=True)
+
+    render_caveats(
+        integrity.get("interpretation"),
+        "What this integrity result does and does not establish",
+        icon="ℹ️",
+    )
+
+    # --- timeline ----------------------------------------------------------- #
+    st.divider()
+    st.subheader("Timeline")
+    try:
+        timeline = fetch_registry_timeline(base_url, run_id)
+    except ApiError as exc:
+        show_api_error(exc, "Timeline")
+        render_provenance(base_url)
+        return
+
+    all_events = timeline.get("events") or []
+    shown = all_events[-25:]
+    st.caption(
+        f"{timeline.get('total_events', timeline.get('count'))} event(s) recorded"
+        + (f"; showing the most recent {len(shown)}." if len(shown) < len(all_events)
+           else ", oldest first.")
+        + f" {timeline.get('note')}"
+    )
+    for event in shown:
+        marker = "📄" if event.get("source") == "evidence" else "📒"
+        st.markdown(
+            f"{marker} **{event.get('event_time')}** · `{event.get('event_type')}` "
+            f"— {event.get('detail')}"
+        )
+
+    render_provenance(base_url)
+
+
+# --------------------------------------------------------------------------- #
 # Router
 # --------------------------------------------------------------------------- #
 def main() -> None:
@@ -1266,6 +1563,7 @@ def main() -> None:
         "Explainability": page_explainability,
         "Governance Decision & Risks": page_governance,
         "Agent Review": page_agent_review,
+        "Model Registry": page_model_registry,
     }
     try:
         renderers[page](base_url)

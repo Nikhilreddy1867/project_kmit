@@ -23,6 +23,13 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.agents import orchestrator
 from app.agents.schemas import AgentListResponse, AgentReport, GovernanceReview
+from app.registry import service as registry_service
+from app.registry.schemas import (
+    AuditRunDetail,
+    IntegrityResponse,
+    RunListResponse,
+    TimelineResponse,
+)
 from app.schemas.models import (
     DecisionResponse,
     ErrorDetail,
@@ -84,6 +91,13 @@ TAGS_METADATA = [
         "description": "Phase 7 deterministic governance agents. Rule-based reporting "
         "over the existing evidence -- not autonomous decision-makers. They never "
         "train, write, recalculate a metric, or alter the governance decision.",
+    },
+    {
+        "name": "registry",
+        "description": "Phase 8 governance audit registry and evidence integrity. "
+        "Records the audit as a content-addressed review run with SHA-256 checksums "
+        "of every referenced artefact. The registry records evidence; it does not "
+        "make decisions.",
     },
 ]
 
@@ -163,6 +177,39 @@ async def _agent_not_found(request: Request, exc: orchestrator.AgentNotFoundErro
             message=str(exc),
             hint="Call GET /api/agents to list the available agents.",
             available=exc.available,
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(registry_service.RunNotFoundError)
+async def _run_not_found(request: Request, exc: registry_service.RunNotFoundError):
+    """404: unknown audit-run id."""
+    return JSONResponse(
+        status_code=404,
+        content=ErrorDetail(
+            error="not_found",
+            message=str(exc),
+            hint="Call GET /api/registry/runs to list registered runs.",
+            available=exc.available,
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(FileNotFoundError)
+async def _registry_uninitialised(request: Request, exc: FileNotFoundError):
+    """
+    503: the registry database has not been created yet.
+
+    Deliberately not a 404 or an empty list -- an uninitialised registry is a
+    setup step the caller must perform, and serving `[]` would read as
+    "this audit was never registered".
+    """
+    return JSONResponse(
+        status_code=503,
+        content=ErrorDetail(
+            error="registry_uninitialised",
+            message=str(exc),
+            hint="Create it with: python -m app.registry.cli register",
         ).model_dump(),
     )
 
@@ -420,3 +467,91 @@ async def agents_run_one(
     model_name: str = _MODEL_QUERY,
 ) -> AgentReport:
     return orchestrator.run_agent(agent_name, model_name)
+
+
+# --------------------------------------------------------------------------- #
+# Registry (Phase 8)
+#
+# Read-only over the registry database. Creating or refreshing a run is a
+# deliberate CLI action (`python -m app.registry.cli register`), not an HTTP call,
+# so the API surface stays read-only.
+# --------------------------------------------------------------------------- #
+_RUN_ID_PARAM = PathParam(
+    description="Content-addressed audit-run id, as listed by GET /api/registry/runs.",
+    examples=["run-047074fcb8e0380a"],
+)
+
+
+@app.get(
+    "/api/registry/runs",
+    response_model=RunListResponse,
+    tags=["registry"],
+    responses=_ERRORS,
+    summary="List registered audit runs",
+    description="Every governance review run in the local registry, newest first, "
+    "with its status (active / superseded / archived), dataset and model version, "
+    "artefact count and recorded decision. Returns 503 if the registry has not been "
+    "created yet.",
+)
+async def registry_runs(
+    status: str | None = Query(
+        default=None,
+        description="Filter by run status.",
+        examples=["active"],
+    ),
+) -> RunListResponse:
+    return RunListResponse(**registry_service.list_runs(status=status))
+
+
+@app.get(
+    "/api/registry/runs/{run_id}",
+    response_model=AuditRunDetail,
+    tags=["registry"],
+    responses=_ERRORS,
+    summary="Full detail for one audit run",
+    description="Dataset and model identity, performance summary, recorded governance "
+    "decision, blocking risk ids, audit coverage, and the complete artefact manifest "
+    "with the SHA-256 checksum captured at registration time.",
+)
+async def registry_run_detail(run_id: str = _RUN_ID_PARAM) -> AuditRunDetail:
+    return AuditRunDetail(**registry_service.get_run(run_id))
+
+
+@app.get(
+    "/api/registry/runs/{run_id}/integrity",
+    response_model=IntegrityResponse,
+    tags=["registry"],
+    responses=_ERRORS,
+    summary="Verify a run's evidence integrity",
+    description="**Recomputes** the SHA-256 of every registered artefact right now "
+    "and classifies each as verified, missing or changed, with an overall status. "
+    "A 'changed' result means this run's conclusions no longer describe the files on "
+    "disk — it is not by itself evidence of wrongdoing, since re-running an audit "
+    "legitimately rewrites its outputs.",
+)
+async def registry_run_integrity(run_id: str = _RUN_ID_PARAM) -> IntegrityResponse:
+    return IntegrityResponse(**registry_service.check_integrity(run_id))
+
+
+@app.get(
+    "/api/registry/runs/{run_id}/timeline",
+    response_model=TimelineResponse,
+    tags=["registry"],
+    responses=_ERRORS,
+    summary="Chronological history for a run",
+    description="Merges the append-only registry event log (registration, refresh, "
+    "status change, integrity check) with evidence events derived from artefact "
+    "modification times, ordered oldest first. The log is append-only, so repeated "
+    "integrity checks accumulate; `limit` returns the most recent events while "
+    "`total_events` always reports the full count.",
+)
+async def registry_run_timeline(
+    run_id: str = _RUN_ID_PARAM,
+    limit: int = Query(
+        default=200,
+        ge=1,
+        le=5000,
+        description="Return at most this many of the most recent events.",
+    ),
+) -> TimelineResponse:
+    return TimelineResponse(**registry_service.get_timeline(run_id, limit=limit))
