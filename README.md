@@ -107,6 +107,112 @@ python src\evaluate.py
 python src\train.py --force-download
 ```
 
+---
+
+## 3a. Governance API (Phase 5) — run locally on Windows
+
+A read-only FastAPI backend that serves the completed audit evidence over HTTP.
+It **never trains, re-scores or writes** — it reads the CSV and Markdown files in
+`results/` and serves them verbatim.
+
+### Prerequisites
+
+The audits must have been run at least once, so the artefacts exist:
+
+```powershell
+python src\train.py
+python src\fairness_audit.py
+python src\explainability_audit.py
+```
+
+`GET /health` reports `status: "degraded"` and lists exactly which artefacts are
+missing if any step was skipped.
+
+### Install and start
+
+```powershell
+cd C:\Users\nreddy\Downloads\project_KMIT
+.\.venv\Scripts\Activate.ps1
+
+# API dependencies (already in requirements.txt)
+pip install -r requirements.txt
+
+# Start the server with hot reload
+uvicorn app.main:app --reload --port 8000
+```
+
+Without activating the venv:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
+```
+
+Stop it with `Ctrl+C`. If port 8000 is busy, pass `--port 8001`.
+
+### URLs
+
+| URL | Purpose |
+|---|---|
+| http://127.0.0.1:8000/docs | **Swagger UI** — interactive docs, try any endpoint |
+| http://127.0.0.1:8000/redoc | ReDoc reference |
+| http://127.0.0.1:8000/openapi.json | OpenAPI 3.1 schema |
+| http://127.0.0.1:8000/ | redirects to `/docs` |
+
+### Endpoints (all `GET`, all read-only)
+
+| Endpoint | Returns |
+|---|---|
+| `/health` | Liveness + presence/size/mtime of all 11 audit artefacts |
+| `/api/models` | Evaluated models with Phase 1 metrics and audit-coverage flags |
+| `/api/models/{model_name}/performance` | Held-out metrics, confusion matrix, error analysis, caveats |
+| `/api/models/{model_name}/fairness` | Phase 2 per-group metrics + disparity measures. Optional `?attribute=sex\|race` |
+| `/api/models/{model_name}/explainability` | Phase 3 importance, proxy assessment, TreeSHAP local cases. Optional `?top_n=N` |
+| `/api/governance/decision` | Research-only approval + deployment block, grounds, conditions. Optional `?include_markdown=true` |
+| `/api/governance/risks` | 12-entry risk register. Optional `?overall_risk=`, `?category=`, `?status=` |
+| `/api/governance/model-card` | Model card Markdown + section list. Optional `?sections_only=true` |
+
+Valid `model_name` values: `xgboost`, `random_forest`, `logistic_regression`.
+Explainability exists for `xgboost` and `logistic_regression` only — Random Forest
+returns **404** with the available alternatives rather than fabricated numbers.
+
+### Quick check
+
+```powershell
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/api/governance/decision
+```
+
+### Error semantics
+
+| Status | Meaning |
+|---|---|
+| 404 | Unknown model or attribute name; the response lists valid alternatives |
+| 405 | A mutating verb was used — the API is read-only by construction |
+| 500 | An artefact exists but is malformed; the response says which |
+| 503 | A required artefact is missing; the response names the script that regenerates it |
+
+### Tests
+
+```powershell
+pytest -q
+```
+
+30 tests covering the health endpoint, every audit-data endpoint, error handling,
+CORS, and two contract guarantees: served values are **exactly equal** to the
+audit CSVs (no recomputation or rounding), and serving the API leaves every
+artefact file unmodified.
+
+### Notes
+
+- **CORS** allows any `http://localhost:<port>` or `http://127.0.0.1:<port>`
+  origin, for a future local dashboard. Credentials are disabled and the wildcard
+  origin is deliberately not used.
+- Artefacts are cached in memory and invalidated on file **mtime**, so re-running
+  an audit is picked up without restarting the server.
+- Floats are parsed with `float_precision="round_trip"`. Pandas' default CSV
+  parser can land one ULP off the written value, which would make the API report
+  a number that differs from the audit it cites.
+
 > Note: `evaluate.py` rewrites `results\model_metrics.csv` without the `fit_seconds`
 > column (it never trains, so it has no timings). Run `train.py` if you want that column.
 

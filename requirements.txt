@@ -9,3 +9,9 @@ scikit-learn>=1.5.0     # Pipeline, ColumnTransformer, LogReg, RandomForest, met
 xgboost>=2.1.0          # XGBClassifier (gradient boosting)
 matplotlib>=3.9.0       # confusion-matrix / comparison PNGs
 joblib>=1.4.0           # model serialisation (.joblib)
+
+# --- Phase 5: read-only governance API (app/) -------------------------------
+fastapi>=0.115.0        # API framework + automatic Swagger/OpenAPI docs
+uvicorn[standard]>=0.30.0  # ASGI server
+pytest>=8.0.0           # test runner for tests/
+httpx>=0.27.0           # required by fastapi.testclient
