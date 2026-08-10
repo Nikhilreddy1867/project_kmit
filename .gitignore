@@ -16,6 +16,9 @@ __pycache__/
 #     python src/train.py
 models/random_forest_pipeline.joblib
 
+# Local server logs (uvicorn / streamlit run output)
+*.log
+
 # OS / editor cruft
 Thumbs.db
 ehthumbs.db

@@ -213,6 +213,124 @@ artefact file unmodified.
   parser can land one ULP off the written value, which would make the API report
   a number that differs from the audit it cites.
 
+---
+
+## 3b. Governance dashboard (Phase 6) — run locally on Windows
+
+A local Streamlit dashboard over the Phase 5 API. It reads **no files**: every
+figure it shows arrives over HTTP from `http://127.0.0.1:8000/api/...`, and it
+recalculates nothing.
+
+### You need TWO PowerShell windows
+
+The API and the dashboard are separate processes. Start the API first — the
+dashboard is useless without it.
+
+**Window 1 — the API:**
+
+```powershell
+cd C:\Users\nreddy\Downloads\project_KMIT
+.\.venv\Scripts\Activate.ps1
+uvicorn app.main:app --reload --port 8000
+```
+
+Leave it running. Wait for `Application startup complete.`
+
+**Window 2 — the dashboard:**
+
+```powershell
+cd C:\Users\nreddy\Downloads\project_KMIT
+.\.venv\Scripts\Activate.ps1
+streamlit run dashboard\streamlit_app.py
+```
+
+Streamlit prints its URL and opens your browser automatically.
+
+### Open
+
+**http://localhost:8501**
+
+Stop either service with `Ctrl+C` in its own window.
+
+### Without activating the venv
+
+```powershell
+# Window 1
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
+# Window 2
+.\.venv\Scripts\python.exe -m streamlit run dashboard\streamlit_app.py
+```
+
+### If a port is already in use
+
+```powershell
+# API on a different port
+uvicorn app.main:app --reload --port 8001
+# Dashboard on a different port
+streamlit run dashboard\streamlit_app.py --server.port 8502
+```
+
+If you move the API, update **API base URL** in the dashboard sidebar to match
+(e.g. `http://127.0.0.1:8001`). The default is `http://127.0.0.1:8000`.
+
+### Pages
+
+| Page | Contents |
+|---|---|
+| **Overview** | Platform purpose, dataset context, API health, primary model (XGBoost) headline metrics, and the prominent governance decision |
+| **Model Performance** | Model selector; accuracy / precision / recall / F1 / ROC-AUC; confusion-matrix counts; error-pattern and threshold caveats from the API |
+| **Fairness Audit** | Model and sex/race selectors; group table; selection-rate / TPR / FPR chart; disparate-impact ratios with four-fifths screening context; small-group and non-causation caveats |
+| **Explainability** | XGBoost global importance chart and ranking table; TreeSHAP local cases; proxy-feature and association-not-causation warnings; explicit unavailable message for unaudited models |
+| **Governance Decision & Risks** | Decision grounds and research-use conditions; filterable risk register; severity counts; model-card sections in expanders |
+
+A **Data provenance and limitations** section appears at the bottom of every
+page, populated from the model card via the API.
+
+### Sidebar
+
+- **Page** — navigation
+- **API base URL** — defaults to `http://127.0.0.1:8000`
+- **↻ Refresh data** — clears the cache; use after re-running an audit
+- **Connection badge** — connected / degraded / not reachable
+
+### Graceful failure states
+
+| State | What you see |
+|---|---|
+| API not started | Red banner with the exact `uvicorn` command to run |
+| API degraded | Amber warning naming the missing artefacts; available pages still work |
+| 404 (e.g. `random_forest` explainability) | Explicit "not available" message listing the models that *do* have data — never fabricated numbers |
+| Malformed / non-JSON response | Clear "unexpected response shape" message naming the missing fields |
+| Timeout | Message advising retry or restart |
+
+### Verify the dashboard
+
+With the API running in window 1:
+
+```powershell
+pytest tests\test_dashboard.py -q
+```
+
+15 tests render every page headlessly via Streamlit's `AppTest` and assert the
+decision wording, the four-fifths screening framing, the proxy warnings, the
+unavailable-model message, and graceful degradation when the API is down. They
+skip automatically if the API is not running.
+
+Run everything at once (API tests + dashboard tests):
+
+```powershell
+pytest -q
+```
+
+### Notes
+
+- The four-fifths (0.80) line is labelled a **screening indicator, not a legal
+  conclusion**, in the interface as well as in the artefacts.
+- The confusion matrix shows **raw counts only** — deriving percentages in the
+  dashboard would mean recomputing a metric the audit owns.
+- Charts reuse the same validated colour palette as the static Phase 2/3 figures,
+  so a colour means the same thing everywhere.
+
 > Note: `evaluate.py` rewrites `results\model_metrics.csv` without the `fit_seconds`
 > column (it never trains, so it has no timings). Run `train.py` if you want that column.
 

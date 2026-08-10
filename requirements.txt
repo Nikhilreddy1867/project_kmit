@@ -14,4 +14,8 @@ joblib>=1.4.0           # model serialisation (.joblib)
 fastapi>=0.115.0        # API framework + automatic Swagger/OpenAPI docs
 uvicorn[standard]>=0.30.0  # ASGI server
 pytest>=8.0.0           # test runner for tests/
-httpx>=0.27.0           # required by fastapi.testclient
+httpx>=0.27.0           # required by fastapi.testclient; also the dashboard's HTTP client
+
+# --- Phase 6: local governance dashboard (dashboard/) -----------------------
+streamlit>=1.40.0       # dashboard UI
+plotly>=5.24.0          # interactive charts
