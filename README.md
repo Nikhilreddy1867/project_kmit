@@ -1,11 +1,200 @@
-# Phase 1 — AI Governance Platform: Income Classification Baseline
+# AI Governance Platform — Adult / Census Income
 
-A reproducible, leakage-free machine-learning baseline on the **UCI Adult / Census Income**
-dataset (UCI repository `id=2`). Trains and compares **Logistic Regression**, **Random Forest**
-and **XGBoost**, and exports per-model predictions that retain `sex` and `race` so Phase 2 can
-run fairness / bias audits without retraining.
+An end-to-end, **locally runnable AI governance platform** built around a single real
+machine-learning model. It does not just train a classifier; it audits one — for
+performance, fairness and explainability — then records a formal governance
+decision, exposes all of it through an API, a dashboard and a deterministic agent
+layer, and finally seals the evidence with cryptographic checksums in an audit
+registry.
 
-Verified end-to-end on **Windows 11 Pro + Python 3.14.6 (64-bit)**, Intel i7, CPU only.
+The model under audit predicts whether a person's annual income exceeds **\$50,000**
+from the **UCI Adult / Census Income** dataset (`id=2`), a 1994 US Census extract.
+That model exists **to be governed, not deployed** — and the platform's conclusion,
+reached from its own evidence, is that it must never be used for a real decision.
+
+Verified end-to-end on **Windows 11 Pro · Python 3.14.6 (64-bit)** · Intel i7 · CPU only.
+**102 tests passing.**
+
+---
+
+## 0. Project description
+
+### 0.1 What problem this addresses
+
+Most ML projects stop at a metrics table. That table is where the hard governance
+questions *begin*:
+
+- Accuracy is **0.8782** — but a model that predicts "everyone earns ≤\$50K" scores
+  **0.7607** on this data. How much of that number is real?
+- The model is accurate overall — but it selects women at **31.5%** the rate it
+  selects men. Is that the model, or the 1994 labour market it learned from?
+- `sex` ranks **10th of 14** features by importance. Does that mean the model is fair?
+  (It does not — and this platform demonstrates precisely why.)
+- Who decided this model may be used, on what evidence, and would anyone notice if
+  that evidence changed after the fact?
+
+This project answers those questions with artefacts rather than assertions, and wires
+them into software a reviewer can actually interrogate.
+
+### 0.2 The eight phases
+
+| # | Phase | Deliverable |
+|---|---|---|
+| **1** | Baseline modelling | Leakage-free pipelines; LogReg / Random Forest / XGBoost compared on one stratified split |
+| **2** | Fairness audit | Group metrics by `sex` and `race`, disparate impact, four-fifths screening, Wilson intervals |
+| **3** | Explainability audit | Permutation importance on original features + exact TreeSHAP local explanations |
+| **4** | Governance assessment | Model card, 12-entry risk register, signed-off decision record |
+| **5** | Read-only API | FastAPI service over the audit evidence, with Swagger |
+| **6** | Dashboard | Streamlit UI consuming only the API |
+| **7** | Agent layer | Four deterministic, rule-based governance agents + orchestrator |
+| **8** | Audit registry | SQLite registry with SHA-256 evidence integrity verification |
+
+Each phase treats the previous phases' outputs as **read-only evidence**. Nothing
+downstream ever rewrites what it audits — a property enforced by tests, not habit.
+
+### 0.3 Architecture at a glance
+
+```text
+   src/            →  data/ models/ predictions/ results/     ← IMMUTABLE EVIDENCE
+   (Phases 1–4)                    │
+                                   │ read-only
+              ┌────────────────────┼────────────────────┐
+              ▼                    ▼                    ▼
+      app/services/         app/agents/          app/registry/
+      (Phase 5 API)         (Phase 7 agents)     (Phase 8 registry)
+              │                    │                    │
+              └──────────── HTTP (JSON) ────────────────┘
+                                   ▼
+                          dashboard/ (Phase 6)
+                          7 pages, reads no files
+```
+
+Data flows **one way only**. The API, agents and dashboard can read the evidence;
+none of them can write to it. The single component that writes anything at all is the
+Phase 8 registry, and it writes to exactly one gitignored SQLite file under
+`runtime/`.
+
+### 0.4 Technology
+
+| Layer | Stack |
+|---|---|
+| ML | scikit-learn 1.9 · XGBoost 3.4 · pandas 3.0 · numpy 2.5 |
+| Explainability | scikit-learn permutation importance · XGBoost native TreeSHAP (`pred_contribs`) |
+| API | FastAPI 0.141 · Pydantic 2.13 · uvicorn |
+| Dashboard | Streamlit 1.61 · Plotly 6.9 |
+| Registry | SQLite (stdlib `sqlite3`) · `hashlib` SHA-256 |
+| Tests | pytest 9.1 · `fastapi.testclient` · `streamlit.testing.v1.AppTest` |
+
+No cloud services, no API keys, no containers — everything runs on one laptop.
+
+### 0.5 Headline findings
+
+**Performance.** XGBoost leads on every metric: ROC-AUC **0.9299**, F1 **0.7239**,
+accuracy **0.8782** on 9,769 held-out rows. It also produces **778 false negatives
+against 412 false positives** — the dominant error is failing to identify real high
+earners, and that error is not evenly distributed.
+
+**Fairness.** Every model selects women at roughly one third the male rate
+(disparate impact **0.299 / 0.307 / 0.315**). Three of four non-reference race groups
+fall below the 0.80 screening threshold. Yet precision is nearly equal across sex
+(0.792 vs 0.783), and the disadvantaged groups receive *fewer* false positives — a
+live demonstration that fairness metrics are **mutually incompatible**, not merely
+inconvenient.
+
+**Explainability.** `sex` ranks 10/14 and `race` 11/14 in importance, while
+`marital-status` ranks 1st and `relationship` — whose categories are literally
+`Husband` and `Wife` — outranks `sex` itself. **Low protected-attribute importance is
+not evidence of fairness.** An audit that had run explainability alone would have
+concluded the opposite of the truth.
+
+**Governance decision.** ✅ *Conditionally approved for research and education only* ·
+⛔ *Blocked from real-world deployment.* Five of twelve risks are Critical. The
+strongest ground is not the disparity but obsolescence: a 1994 \$50K threshold is
+roughly \$105–110K today, so the model is miscalibrated against any present-day
+population by construction.
+
+### 0.6 What this project deliberately does not claim
+
+- **No finding of discrimination.** The audits measure output differences. A legal
+  determination would require a deployment context, a jurisdiction and a standard —
+  none of which exist here.
+- **No causal claim.** Permutation importance and SHAP describe how a fitted function
+  responds to its inputs on one dataset. Neither is a causal estimand.
+- **No separation of model bias from label bias.** Group base rates differ in the
+  1994 labels themselves (30.4% vs 11.2% by sex). No method used here can tell
+  "the model is unfair" apart from "the labour market it recorded was unequal".
+- **The four-fifths rule is a screening trigger**, not a verdict or a statistical test.
+
+These limits are carried in the schemas, the API responses, the agent findings and
+the dashboard — so a consumer cannot read the numbers without also receiving the
+caveats.
+
+### 0.7 Engineering properties worth noting
+
+- **Leakage prevention is structural.** The split precedes all fitting; every learned
+  transformation lives inside a `Pipeline`. `pipeline.fit(X_train, y_train)` is the
+  only `fit` call in the codebase.
+- **Deterministic throughout.** `random_state=42` everywhere; the agent layer has no
+  timestamps or randomness, so the same evidence yields byte-identical output.
+- **No recomputation downstream.** The API serves audit numbers verbatim — including
+  reading CSVs with `float_precision="round_trip"`, because pandas' default parser
+  lands one ULP off and would have made the API cite numbers the audit never wrote.
+- **Absence is reported, never imputed.** Random Forest has no explainability audit,
+  so that endpoint returns 404 and the agent returns `status: unavailable`. No
+  estimated stand-in is ever produced.
+- **Evidence integrity is verifiable.** 34 artefacts are checksummed; the registry
+  re-verifies them on demand and reports verified / missing / changed.
+
+### 0.8 Quick start
+
+```powershell
+cd C:\Users\nreddy\Downloads\project_KMIT
+py -3.14 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+# Phases 1–3: build the evidence (~1 minute total)
+python src\train.py
+python src\fairness_audit.py
+python src\explainability_audit.py
+
+# Phase 8: seal it in the registry
+python -m app.registry.cli register
+
+# Phases 5–7: API   (window 1)
+uvicorn app.main:app --reload --port 8000
+# Phase 6: dashboard (window 2)
+streamlit run dashboard\streamlit_app.py
+```
+
+| Service | URL |
+|---|---|
+| Dashboard | **http://localhost:8501** |
+| Swagger API docs | **http://127.0.0.1:8000/docs** |
+
+Phase 4 needs no command — the model card, risk register and decision record are
+committed documents under `results/governance/`.
+
+Full test suite: `pytest -q` → **102 passed** (30 API · 28 agents · 22 registry ·
+22 dashboard). The dashboard tests need the API running; they skip cleanly otherwise.
+
+### 0.9 Document map
+
+| Section | Contents |
+|---|---|
+| §1–§3 | Project structure, Windows setup, running the ML pipeline |
+| §3a | Phase 5 — API endpoints, error semantics |
+| §3b | Phase 6 — dashboard, two-window setup, failure states |
+| §3c | Phase 7 — agents, architecture diagram, hard constraints |
+| §3d | Phase 8 — registry, idempotency, integrity semantics |
+| §4–§5 | Results table and full methodology |
+| §6–§7 | Assumptions, deliberate non-choices, troubleshooting |
+
+Deeper governance reading lives in the artefacts themselves:
+[`model_card.md`](results/governance/model_card.md),
+[`governance_summary.md`](results/governance/governance_summary.md) (the decision
+record), [`fairness_report.md`](results/fairness/fairness_report.md) and
+[`explainability_report.md`](results/explainability/explainability_report.md).
 
 ---
 
@@ -13,30 +202,62 @@ Verified end-to-end on **Windows 11 Pro + Python 3.14.6 (64-bit)**, Intel i7, CP
 
 ```text
 project_KMIT/
-├── data/
-│   └── raw/
-│       ├── adult_raw.csv                # untouched snapshot fetched from UCI (48,842 × 15)
-│       └── adult_metadata.txt           # UCI metadata + variable dictionary
-├── models/
-│   ├── logistic_regression_pipeline.joblib   # full fitted Pipeline (preprocessing + model)
-│   ├── random_forest_pipeline.joblib
-│   └── xgboost_pipeline.joblib
-├── predictions/
-│   ├── logistic_regression_test_predictions.csv
-│   ├── random_forest_test_predictions.csv
-│   └── xgboost_test_predictions.csv
-├── results/
-│   ├── model_metrics.csv                # the comparison table
-│   ├── model_comparison.png             # grouped bar chart of all metrics
-│   ├── confusion_matrix_logistic_regression.png
-│   ├── confusion_matrix_random_forest.png
-│   ├── confusion_matrix_xgboost.png
-│   └── classification_report_<model>.txt
-├── src/
+├── data/raw/                            # IMMUTABLE EVIDENCE — never rewritten
+│   ├── adult_raw.csv                    # untouched snapshot from UCI (48,842 × 15)
+│   └── adult_metadata.txt               # UCI metadata + variable dictionary
+├── models/                              # Phase 1 — full fitted Pipelines
+│   ├── xgboost_pipeline.joblib          # selected baseline (preprocessing + model)
+│   ├── logistic_regression_pipeline.joblib
+│   └── random_forest_pipeline.joblib    # ~100 MB, gitignored; regenerate via train.py
+├── predictions/                         # Phase 1 — test predictions + sex/race
+│   └── <model>_test_predictions.csv
+├── results/                             # all audit outputs
+│   ├── model_metrics.csv                # Phase 1 comparison table
+│   ├── model_comparison.png
+│   ├── confusion_matrix_<model>.png
+│   ├── classification_report_<model>.txt
+│   ├── fairness/                        # Phase 2
+│   │   ├── fairness_metrics_by_group.csv
+│   │   ├── fairness_summary.csv
+│   │   ├── fairness_report.md
+│   │   └── chart_*.png
+│   ├── explainability/                  # Phase 3
+│   │   ├── global_feature_importance.csv|png
+│   │   ├── local_explanations.csv
+│   │   ├── logistic_regression_coefficients.csv
+│   │   └── explainability_report.md
+│   └── governance/                      # Phase 4
+│       ├── model_card.md
+│       ├── governance_risk_register.csv
+│       └── governance_summary.md        # ← the decision record
+├── src/                                 # Phases 1–3 — the audit pipeline
 │   ├── data_loader.py                   # fetch + raw snapshot + cleaning
 │   ├── preprocessing.py                 # ColumnTransformer + the canonical split
 │   ├── train.py                         # entry point: train all 3 models
-│   └── evaluate.py                      # metrics, prediction export, plots
+│   ├── evaluate.py                      # metrics, prediction export, plots
+│   ├── fairness_audit.py                # Phase 2
+│   └── explainability_audit.py          # Phase 3
+├── app/                                 # Phases 5, 7, 8 — backend
+│   ├── main.py                          # FastAPI app: all routes
+│   ├── services/                        # artifact_reader.py (only file I/O)
+│   │   └── governance_service.py        # payload assembly
+│   ├── schemas/models.py                # Pydantic response schemas
+│   ├── agents/                          # Phase 7 — 4 deterministic agents
+│   │   ├── performance_agent.py  fairness_agent.py
+│   │   ├── explainability_agent.py  risk_agent.py
+│   │   ├── orchestrator.py  schemas.py
+│   └── registry/                        # Phase 8 — audit registry
+│       ├── integrity.py                 # SHA-256 discovery + verification
+│       ├── db.py                        # SQLite (the only writer)
+│       ├── service.py  schemas.py  cli.py
+├── dashboard/                           # Phase 6 — Streamlit UI (7 pages)
+│   ├── streamlit_app.py
+│   └── api_client.py                    # HTTP only; reads no files
+├── tests/                               # 102 tests
+│   ├── test_api.py  test_agents.py
+│   ├── test_registry.py  test_dashboard.py
+├── runtime/                             # gitignored local state
+│   └── governance_registry.db           # rebuild: python -m app.registry.cli register
 ├── requirements.txt
 └── README.md
 ```
