@@ -331,6 +331,156 @@ pytest -q
 - Charts reuse the same validated colour palette as the static Phase 2/3 figures,
   so a colour means the same thing everywhere.
 
+---
+
+## 3c. Governance agents (Phase 7)
+
+Four **deterministic, rule-based** governance agents that read the existing audit
+evidence and emit structured findings. They are **not autonomous decision-makers**
+and not language models: they quote evidence verbatim, classify it against fixed
+documented thresholds, and cannot train, write, recalculate a metric, or alter the
+governance decision.
+
+### Architecture
+
+```text
+                    ┌──────────────────────────────────────────────┐
+                    │  IMMUTABLE EVIDENCE  (read-only, never written by API/agents)
+                    │                                              │
+   Phase 1 ─────────┤  data/raw/adult_raw.csv      (1994 UCI snapshot)
+   src/train.py     │  models/*.joblib             (fitted pipelines)
+                    │  predictions/*.csv           (test predictions + sex/race)
+   Phase 2 ─────────┤  results/model_metrics.csv
+   src/fairness_    │  results/fairness/*.csv|md
+     audit.py       │  results/explainability/*.csv|md
+   Phase 3 ─────────┤  results/governance/model_card.md
+   src/explain...   │  results/governance/governance_risk_register.csv
+   Phase 4 (docs) ──┤  results/governance/governance_summary.md
+                    └────────────────────┬─────────────────────────┘
+                                         │ read-only, mtime-cached
+                                         │ float_precision="round_trip"
+                    ┌────────────────────▼─────────────────────────┐
+                    │  PHASE 5 — FastAPI service  (app/)           │
+                    │                                              │
+                    │  services/artifact_reader.py   ← only file I/O
+                    │  services/governance_service.py ← shapes payloads
+                    │  schemas/models.py              ← Pydantic responses
+                    │                                              │
+                    │  GET /health                                 │
+                    │  GET /api/models                             │
+                    │  GET /api/models/{m}/performance             │
+                    │  GET /api/models/{m}/fairness                │
+                    │  GET /api/models/{m}/explainability          │
+                    │  GET /api/governance/decision                │
+                    │  GET /api/governance/risks                   │
+                    │  GET /api/governance/model-card              │
+                    └──────────┬───────────────────────┬───────────┘
+                               │ in-process            │ HTTP (JSON)
+                               │ (same response models)│
+             ┌─────────────────▼──────────────┐        │
+             │  PHASE 7 — agents (app/agents/)│        │
+             │  deterministic · rule-based    │        │
+             │                                │        │
+             │   performance_agent  ─┐        │        │
+             │   fairness_agent      ├─►      │        │
+             │   explainability_agent│ orchestrator    │
+             │   risk_agent         ─┘        │        │
+             │                                │        │
+             │  GET /api/agents               │        │
+             │  GET /api/agents/{agent}       │        │
+             │  GET /api/agents/review        │        │
+             │                                │        │
+             │  Decision is COPIED, never     │        │
+             │  derived: research-only /      │        │
+             │  deployment blocked            │        │
+             └─────────────────┬──────────────┘        │
+                               │ HTTP (JSON)           │
+                    ┌──────────▼───────────────────────▼───────────┐
+                    │  PHASE 6 — Streamlit dashboard (dashboard/)  │
+                    │  reads NO files · recalculates nothing       │
+                    │                                              │
+                    │  Overview · Model Performance · Fairness     │
+                    │  Explainability · Governance & Risks         │
+                    │  Agent Review                                │
+                    └──────────────────────────────────────────────┘
+
+Data flows one way only: evidence → API → agents/dashboard.
+Nothing to the right of the evidence box ever writes to the left of it.
+```
+
+### The four agents
+
+| Agent | Reads | Reports |
+|---|---|---|
+| `performance` | `/api/models/{m}/performance` | Headline metrics, error counts and asymmetry, threshold and single-split limitations |
+| `fairness` | `/api/models/{m}/fairness` | Disparities by sex/race, four-fifths screening context, small-group uncertainty, metric conflicts |
+| `explainability` | `/api/models/{m}/explainability` | Top features, proxy-feature concerns, association-vs-causation and dilution limits |
+| `risk` | `/api/governance/decision`, `/api/governance/risks` | Blocking and Critical risks, research-use conditions, the deployment recommendation |
+
+Every finding carries: **agent name · severity · finding · evidence source (API
+endpoint) · limitations · recommended action**, plus the raw quoted evidence.
+
+### Hard constraints
+
+- **Never train, never write.** Read-only access to the artefacts only.
+- **Never recalculate.** Values are quoted verbatim. Where a judgement needs a
+  threshold comparison, the agent uses the **audit's own boolean**
+  (`fails_four_fifths_rule`, `small_group_flag`) rather than re-deriving it.
+- **Never override the decision.** The Risk agent copies the committed decision;
+  the orchestrator's `overall_recommendation` **is** the committed headline,
+  restated. There is no code path by which agents can approve deployment.
+- **Never claim a legal violation or causation.** Enforced by tests that reject
+  forbidden phrasings in the fairness agent's output.
+- **Never invent missing evidence.** A model with no explainability audit yields
+  `status: unavailable` and an explicit "no evidence exists" finding.
+- **Deterministic.** Fixed thresholds, no randomness, no timestamps — the same
+  artefacts always produce byte-identical output.
+
+### Run (same two windows as §3b)
+
+```powershell
+# Window 1 — API (now also serves the agent endpoints)
+cd C:\Users\nreddy\Downloads\project_KMIT
+.\.venv\Scripts\Activate.ps1
+uvicorn app.main:app --reload --port 8000
+
+# Window 2 — dashboard
+cd C:\Users\nreddy\Downloads\project_KMIT
+.\.venv\Scripts\Activate.ps1
+streamlit run dashboard\streamlit_app.py
+```
+
+Then open **http://localhost:8501** and choose **Agent Review** in the sidebar.
+
+### Try the endpoints
+
+```powershell
+curl http://127.0.0.1:8000/api/agents
+curl "http://127.0.0.1:8000/api/agents/fairness?model_name=xgboost"
+curl "http://127.0.0.1:8000/api/agents/review?model_name=xgboost"
+```
+
+Swagger documents all three under the **agents** tag:
+http://127.0.0.1:8000/docs
+
+### Test
+
+```powershell
+pytest tests\test_agents.py -q      # 28 tests, no server needed
+pytest -q                           # everything (API needed for dashboard tests)
+```
+
+The agent tests assert that **every quoted value equals the source endpoint
+exactly** (`==`, not approximate), that the decision is preserved field for field,
+that output is deterministic across runs, and that running the agents modifies no
+artefact.
+
+### Note on `/api/agents/review` route order
+
+`/api/agents/review` is declared **before** `/api/agents/{agent_name}` in
+`app/main.py`. Reversed, FastAPI would match `review` as an agent name and the
+review endpoint would become unreachable. A test pins this.
+
 > Note: `evaluate.py` rewrites `results\model_metrics.csv` without the `fit_seconds`
 > column (it never trains, so it has no timings). Run `train.py` if you want that column.
 

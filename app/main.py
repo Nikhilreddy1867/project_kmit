@@ -21,6 +21,8 @@ from fastapi import FastAPI, Path as PathParam, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 
+from app.agents import orchestrator
+from app.agents.schemas import AgentListResponse, AgentReport, GovernanceReview
 from app.schemas.models import (
     DecisionResponse,
     ErrorDetail,
@@ -76,6 +78,12 @@ TAGS_METADATA = [
     {
         "name": "governance",
         "description": "Phase 4 decision record, risk register and model card.",
+    },
+    {
+        "name": "agents",
+        "description": "Phase 7 deterministic governance agents. Rule-based reporting "
+        "over the existing evidence -- not autonomous decision-makers. They never "
+        "train, write, recalculate a metric, or alter the governance decision.",
     },
 ]
 
@@ -141,6 +149,20 @@ async def _artifact_missing(request: Request, exc: reader.ArtifactMissingError):
             error="artifact_unavailable",
             message=f"Required audit artefact '{exc.key}' is missing at {exc.path}.",
             hint=exc.how_to_fix,
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(orchestrator.AgentNotFoundError)
+async def _agent_not_found(request: Request, exc: orchestrator.AgentNotFoundError):
+    """404: unknown agent name."""
+    return JSONResponse(
+        status_code=404,
+        content=ErrorDetail(
+            error="not_found",
+            message=str(exc),
+            hint="Call GET /api/agents to list the available agents.",
+            available=exc.available,
         ).model_dump(),
     )
 
@@ -327,3 +349,74 @@ async def governance_model_card(
     ),
 ) -> ModelCardResponse:
     return ModelCardResponse(**svc.build_model_card(sections_only=sections_only))
+
+
+# --------------------------------------------------------------------------- #
+# Agents (Phase 7)
+#
+# ROUTE ORDER MATTERS: `/api/agents/review` must be declared BEFORE
+# `/api/agents/{agent_name}`, or FastAPI would match "review" as an agent name and
+# the review endpoint would become unreachable. Covered by a test.
+# --------------------------------------------------------------------------- #
+_AGENT_DISCLAIMER_NOTE = (
+    "Deterministic, rule-based reporting agents -- NOT autonomous decision-makers. "
+    "They read existing evidence, never train or write, never recalculate a metric, "
+    "and never alter the governance decision."
+)
+
+_MODEL_QUERY = Query(
+    default="xgboost",
+    description="Model to review, as listed by GET /api/models.",
+    examples=["xgboost"],
+)
+
+
+@app.get(
+    "/api/agents",
+    response_model=AgentListResponse,
+    tags=["agents"],
+    responses=_ERRORS,
+    summary="List the governance agents",
+    description="Self-description of each deterministic agent: what it reads, what it "
+    "reports, and what it must never do. " + _AGENT_DISCLAIMER_NOTE,
+)
+async def agents_list() -> AgentListResponse:
+    return orchestrator.list_agents()
+
+
+@app.get(
+    "/api/agents/review",
+    response_model=GovernanceReview,
+    tags=["agents"],
+    responses=_ERRORS,
+    summary="Orchestrated multi-agent governance review",
+    description="Runs all four agents in a fixed order and returns one structured "
+    "review: every finding with its severity, evidence source, limitations and "
+    "recommended action, plus severity counts. The `overall_recommendation` is the "
+    "committed governance decision **restated verbatim** — the agents do not produce "
+    "it and cannot change it. " + _AGENT_DISCLAIMER_NOTE,
+)
+async def agents_review(model_name: str = _MODEL_QUERY) -> GovernanceReview:
+    return orchestrator.run_review(model_name)
+
+
+@app.get(
+    "/api/agents/{agent_name}",
+    response_model=AgentReport,
+    tags=["agents"],
+    responses=_ERRORS,
+    summary="Run one governance agent",
+    description="Runs a single agent for one model. Agent names: `performance`, "
+    "`fairness`, `explainability`, `risk`. Where the underlying audit does not cover "
+    "the model, the agent returns `status: unavailable` with an explicit "
+    "'no evidence exists' finding rather than estimating anything. "
+    + _AGENT_DISCLAIMER_NOTE,
+)
+async def agents_run_one(
+    agent_name: str = PathParam(
+        description="One of: performance, fairness, explainability, risk.",
+        examples=["fairness"],
+    ),
+    model_name: str = _MODEL_QUERY,
+) -> AgentReport:
+    return orchestrator.run_agent(agent_name, model_name)

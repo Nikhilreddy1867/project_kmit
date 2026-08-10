@@ -38,6 +38,7 @@ PAGES = [
     "Fairness Audit",
     "Explainability",
     "Governance Decision & Risks",
+    "Agent Review",
 ]
 
 
@@ -63,12 +64,28 @@ def _run(page: str, timeout: float = 60) -> AppTest:
 
 
 def _all_text(at: AppTest) -> str:
+    """
+    Collect the app's rendered text.
+
+    Includes **expander labels and their nested content**: on the Agent Review page
+    each finding is an expander whose label carries the finding id, so a helper that
+    only read top-level markdown would miss them.
+    """
     parts: list[str] = []
     for element in ("markdown", "caption", "info", "warning", "error", "success", "text"):
         try:
             parts += [getattr(item, "value", "") for item in getattr(at, element)]
         except AttributeError:
             continue
+    try:
+        for expander in at.expander:
+            parts.append(getattr(expander, "label", "") or "")
+            for element in ("markdown", "caption", "info", "warning", "error", "success"):
+                parts += [
+                    getattr(item, "value", "") for item in getattr(expander, element, [])
+                ]
+    except AttributeError:
+        pass
     return " ".join(str(p) for p in parts)
 
 
@@ -180,6 +197,49 @@ def test_provenance_section_present_on_every_page() -> None:
         at = _run(page)
         headers = " ".join(h.value for h in at.subheader)
         assert "Data provenance and limitations" in headers, f"missing on {page}"
+
+
+def test_agent_review_page_shows_four_agents_and_preserved_decision() -> None:
+    at = _run("Agent Review")
+    text = _all_text(at)
+
+    # The non-autonomy label must be present and prominent.
+    assert "deterministic governance agents, not autonomous" in text.lower()
+    assert "do not train models, recalculate metrics" in text.lower()
+
+    # All four agents render as tabs, and the preserved decision is restated.
+    assert "Blocked from real-world deployment" in text
+    assert "Conditionally approved for research/education only" in text
+    assert "cannot alter, soften or override" in text
+
+    labels = [m.label for m in at.metric]
+    assert "Findings" in labels and "Highest" in labels
+    assert any("Critical" in label for label in labels)
+    assert at.selectbox("agent_model").value == "xgboost"
+
+
+def test_agent_review_page_surfaces_findings_and_evidence_sources() -> None:
+    at = _run("Agent Review")
+    text = _all_text(at)
+    # Every finding carries an evidence source and a recommended action.
+    assert "Evidence source:" in text
+    assert "Recommended action." in text
+    assert "Limitations / caveats" in text
+    # Findings from all four agents should be reachable.
+    for marker in ("PERF-", "FAIR-", "EXPL-", "RISK-"):
+        assert marker in text, f"no {marker} finding rendered"
+
+
+def test_agent_review_page_reports_unavailable_evidence() -> None:
+    at = AppTest.from_file(APP, default_timeout=90)
+    at.run()
+    at.session_state["page"] = "Agent Review"
+    at.run()
+    at.selectbox("agent_model").set_value("random_forest").run()
+    assert not at.exception
+    text = _all_text(at)
+    assert "evidence unavailable" in text.lower()
+    assert "rather than estimating anything" in text.lower()
 
 
 def test_unreachable_api_degrades_gracefully() -> None:

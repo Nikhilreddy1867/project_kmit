@@ -50,6 +50,7 @@ PAGES = [
     "Fairness Audit",
     "Explainability",
     "Governance Decision & Risks",
+    "Agent Review",
 ]
 
 st.set_page_config(
@@ -160,6 +161,16 @@ def fetch_risks(
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_model_card(base_url: str, sections_only: bool = False) -> dict[str, Any]:
     return GovernanceApiClient(base_url).model_card(sections_only=sections_only)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_agents(base_url: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).agents()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_agent_review(base_url: str, model: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).agent_review(model)
 
 
 # --------------------------------------------------------------------------- #
@@ -1064,6 +1075,186 @@ def page_governance(base_url: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Page 6 — Agent Review
+# --------------------------------------------------------------------------- #
+SEVERITY_STYLE = {
+    "critical": ("🔴", C_THRESHOLD),
+    "high": ("🟠", C_TPR),
+    "medium": ("🟡", "#eda100"),
+    "low": ("🔵", C_SELECTION),
+    "info": ("⚪", INK_SECONDARY),
+}
+
+
+def page_agent_review(base_url: str) -> None:
+    st.title("Agent review")
+
+    # The non-autonomy label must be impossible to miss, above everything else.
+    st.info(
+        "**These are deterministic governance agents, not autonomous "
+        "decision-makers.** They are rule-based: they read the existing audit "
+        "evidence, quote it verbatim, and classify it against fixed documented "
+        "thresholds. They do not train models, recalculate metrics, exercise "
+        "judgement, or make or change any governance decision. Severity labels are a "
+        "triage convention, not measurements.",
+        icon="🤖",
+    )
+
+    try:
+        models = fetch_models(base_url)
+    except ApiError as exc:
+        show_api_error(exc, "Model list")
+        return
+
+    names = [str(m.get("model_name")) for m in models.get("models") or []]
+    if not names:
+        st.warning("The API returned no evaluated models.", icon="⚠️")
+        return
+
+    default = "xgboost" if "xgboost" in names else names[0]
+    model = st.selectbox(
+        "Model to review", names, index=names.index(default), key="agent_model"
+    )
+
+    # --- the agent roster -------------------------------------------------- #
+    try:
+        roster = fetch_agents(base_url)
+        with st.expander(
+            f"The {roster.get('count')} agents — what each reads and must never do",
+            expanded=False,
+        ):
+            st.caption(roster.get("determinism", ""))
+            for agent in roster.get("agents") or []:
+                st.markdown(f"**`{agent.get('agent_name')}`** — {agent.get('agent_role')}")
+                st.caption("Reads: " + ", ".join(f"`{r}`" for r in agent.get("reads") or []))
+                for constraint in agent.get("constraints") or []:
+                    st.markdown(f"  - 🚫 {constraint}")
+                st.divider()
+    except ApiError as exc:
+        show_api_error(exc, "Agent roster")
+
+    try:
+        review = fetch_agent_review(base_url, model)
+    except ApiError as exc:
+        show_api_error(exc, f"Agent review for {model}")
+        render_provenance(base_url)
+        return
+
+    # --- orchestrated recommendation (the preserved decision) -------------- #
+    st.subheader("Orchestrated recommendation")
+    preserved = review.get("preserved_decision") or {}
+    render_decision_banner(
+        {
+            "research_use": preserved.get("research_use"),
+            "real_world_deployment": preserved.get("real_world_deployment"),
+            "disclaimer": review.get("disclaimer"),
+        }
+    )
+    st.success(f"**{review.get('overall_recommendation')}**", icon="📌")
+    st.caption(
+        f"↳ {preserved.get('note')} Source: `{preserved.get('source')}`. "
+        "The agents did not generate this recommendation and cannot alter it."
+    )
+
+    # --- severity summary -------------------------------------------------- #
+    st.divider()
+    st.subheader("Findings by severity")
+    counts: dict[str, int] = review.get("severity_counts") or {}
+    ordered = {k: counts.get(k, 0) for k in ("critical", "high", "medium", "low", "info")}
+
+    cols = st.columns(len(ordered) + 2)
+    cols[0].metric("Findings", _fmt(review.get("findings_total")))
+    cols[1].metric("Highest", str(review.get("highest_severity", "")).upper())
+    for col, (level, count) in zip(cols[2:], ordered.items()):
+        icon, _ = SEVERITY_STYLE[level]
+        col.metric(f"{icon} {level.capitalize()}", _fmt(count))
+
+    fig = go.Figure(
+        go.Bar(
+            x=list(ordered.keys()),
+            y=list(ordered.values()),
+            marker_color=[SEVERITY_STYLE[k][1] for k in ordered],
+            text=[str(v) for v in ordered.values()],
+            textposition="outside",
+            hovertemplate="%{x}: %{y} finding(s)<extra></extra>",
+        )
+    )
+    st.plotly_chart(_style(fig, height=300, y_title="Findings"), width="stretch")
+    st.caption(
+        "Counts of findings per triage label. Severity is not a measurement and the "
+        "labels are not combined into a score."
+    )
+
+    if review.get("unavailable_evidence"):
+        st.warning(
+            "**Evidence unavailable for this model:** "
+            + "; ".join(review["unavailable_evidence"])
+            + ". The agents reported this explicitly rather than estimating anything.",
+            icon="🚫",
+        )
+
+    for note in review.get("consensus_notes") or []:
+        st.caption(f"• {note}")
+
+    # --- the four agent reports -------------------------------------------- #
+    st.divider()
+    st.subheader("Agent findings")
+    reports = review.get("agents") or []
+    tabs = st.tabs([f"{r.get('agent_name', '?').capitalize()}" for r in reports])
+
+    for tab, report in zip(tabs, reports):
+        with tab:
+            status = str(report.get("status"))
+            if status == "unavailable":
+                st.warning(f"Status: **{status}** — {report.get('summary')}", icon="🚫")
+            elif status == "ok":
+                st.success(f"Status: **{status}**", icon="✅")
+            else:
+                st.error(f"Status: **{status}**", icon="⚠️")
+
+            st.markdown(f"**Role.** {report.get('agent_role')}")
+            st.markdown(f"**Summary.** {report.get('summary')}")
+            st.caption(
+                f"Agent type: `{report.get('agent_type')}` · evidence: "
+                + ", ".join(f"`{s}`" for s in report.get("evidence_sources") or [])
+            )
+
+            for finding in report.get("findings") or []:
+                level = str(finding.get("severity", "info")).lower()
+                icon, _ = SEVERITY_STYLE.get(level, ("⚪", INK_SECONDARY))
+                label = (
+                    f"{icon} {finding.get('finding_id')} · {level.upper()} · "
+                    f"{str(finding.get('finding', ''))[:90]}..."
+                )
+                with st.expander(label, expanded=(level in ("critical", "high"))):
+                    st.markdown(f"**Finding.** {finding.get('finding')}")
+                    st.markdown(
+                        f"**Recommended action.** {finding.get('recommended_action')}"
+                    )
+                    st.caption(f"Evidence source: `{finding.get('evidence_source')}`")
+
+                    st.markdown("**Limitations / caveats**")
+                    for limitation in finding.get("limitations") or []:
+                        if limitation:
+                            st.markdown(f"- {limitation}")
+
+                    with st.expander("Evidence quoted from the API", expanded=False):
+                        st.caption(
+                            "Values below are quoted verbatim from the evidence source. "
+                            "The agent performs no arithmetic on them."
+                        )
+                        st.json(finding.get("evidence") or {})
+
+            if report.get("caveats"):
+                with st.expander("Caveats supplied by the source API", expanded=False):
+                    for caveat in report["caveats"]:
+                        if caveat:
+                            st.markdown(f"- {caveat}")
+
+    render_provenance(base_url)
+
+
+# --------------------------------------------------------------------------- #
 # Router
 # --------------------------------------------------------------------------- #
 def main() -> None:
@@ -1074,6 +1265,7 @@ def main() -> None:
         "Fairness Audit": page_fairness,
         "Explainability": page_explainability,
         "Governance Decision & Risks": page_governance,
+        "Agent Review": page_agent_review,
     }
     try:
         renderers[page](base_url)

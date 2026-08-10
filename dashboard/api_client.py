@@ -217,3 +217,25 @@ class GovernanceApiClient:
             ("sections", "source"),
             "GET /api/governance/model-card",
         )
+
+    # -- Phase 7: deterministic governance agents --------------------------- #
+    def agents(self) -> dict[str, Any]:
+        return self._require(
+            self._get("/api/agents"),
+            ("agents", "count", "disclaimer"),
+            "GET /api/agents",
+        )
+
+    def agent(self, agent_name: str, model_name: str) -> dict[str, Any]:
+        return self._require(
+            self._get(f"/api/agents/{agent_name}", {"model_name": model_name}),
+            ("agent_name", "status", "findings"),
+            f"GET /api/agents/{agent_name}",
+        )
+
+    def agent_review(self, model_name: str) -> dict[str, Any]:
+        return self._require(
+            self._get("/api/agents/review", {"model_name": model_name}),
+            ("agents", "findings_total", "preserved_decision", "overall_recommendation"),
+            "GET /api/agents/review",
+        )
