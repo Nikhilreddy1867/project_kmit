@@ -1,0 +1,25 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python bytecode / packaging
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.ipynb_checkpoints/
+
+# Large regenerable model artefact (99.9 MB - near GitHub's 100 MiB per-file limit).
+# The other two pipelines are committed so the Phase 2/3 audits can be verified
+# without retraining. Regenerate this one deterministically with:
+#     python src/train.py
+models/random_forest_pipeline.joblib
+
+# OS / editor cruft
+Thumbs.db
+ehthumbs.db
+.DS_Store
+.vscode/
+.idea/
+*.swp

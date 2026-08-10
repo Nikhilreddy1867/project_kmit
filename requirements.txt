@@ -1,0 +1,11 @@
+# Phase 1 - AI Governance Platform : income-classification baseline
+# Lower bounds only, so pip resolves wheels that exist for your Python version.
+# Tested on Windows 11 + Python 3.14 (64-bit).
+
+ucimlrepo>=0.0.7        # UCI dataset fetcher (Adult / Census Income = id 2)
+pandas>=2.2.0           # dataframes, CSV I/O
+numpy>=2.1.0            # numerics
+scikit-learn>=1.5.0     # Pipeline, ColumnTransformer, LogReg, RandomForest, metrics
+xgboost>=2.1.0          # XGBClassifier (gradient boosting)
+matplotlib>=3.9.0       # confusion-matrix / comparison PNGs
+joblib>=1.4.0           # model serialisation (.joblib)

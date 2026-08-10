@@ -1,0 +1,11 @@
+Model: logistic_regression
+
+              precision    recall  f1-score   support
+
+   <=50K (0)     0.8794    0.9314    0.9046      7431
+    >50K (1)     0.7314    0.5941    0.6557      2338
+
+    accuracy                         0.8507      9769
+   macro avg     0.8054    0.7627    0.7801      9769
+weighted avg     0.8440    0.8507    0.8451      9769
+
