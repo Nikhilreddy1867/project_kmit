@@ -13,7 +13,7 @@ That model exists **to be governed, not deployed** — and the platform's conclu
 reached from its own evidence, is that it must never be used for a real decision.
 
 Verified end-to-end on **Windows 11 Pro · Python 3.14.6 (64-bit)** · Intel i7 · CPU only.
-**102 tests passing.**
+**113 tests passing.**
 
 ---
 
@@ -161,10 +161,13 @@ python src\explainability_audit.py
 # Phase 8: seal it in the registry
 python -m app.registry.cli register
 
-# Phases 5–7: API   (window 1)
+# Phases 5-7: API   (window 1)
 uvicorn app.main:app --reload --port 8000
 # Phase 6: dashboard (window 2)
 streamlit run dashboard\streamlit_app.py
+
+# ...or both halves in ONE process (also how it deploys - see 3e)
+streamlit run streamlit_app.py
 ```
 
 | Service | URL |
@@ -175,8 +178,9 @@ streamlit run dashboard\streamlit_app.py
 Phase 4 needs no command — the model card, risk register and decision record are
 committed documents under `results/governance/`.
 
-Full test suite: `pytest -q` → **102 passed** (30 API · 28 agents · 22 registry ·
-22 dashboard). The dashboard tests need the API running; they skip cleanly otherwise.
+Full test suite: `pytest -q` → **113 passed** (30 API · 28 agents · 22 registry ·
+22 dashboard · 11 deployment). The dashboard tests need the API running and skip
+cleanly otherwise; the deployment tests need no server at all.
 
 ### 0.9 Document map
 
@@ -187,6 +191,7 @@ Full test suite: `pytest -q` → **102 passed** (30 API · 28 agents · 22 regis
 | §3b | Phase 6 — dashboard, two-window setup, failure states |
 | §3c | Phase 7 — agents, architecture diagram, hard constraints |
 | §3d | Phase 8 — registry, idempotency, integrity semantics |
+| §3e | **Deploying to Streamlit Community Cloud** (single-process entry point) |
 | §4–§5 | Results table and full methodology |
 | §6–§7 | Assumptions, deliberate non-choices, troubleshooting |
 
@@ -250,14 +255,18 @@ project_KMIT/
 │       ├── integrity.py                 # SHA-256 discovery + verification
 │       ├── db.py                        # SQLite (the only writer)
 │       ├── service.py  schemas.py  cli.py
+│   └── embedded.py                      # runs the API in-process (deployment)
 ├── dashboard/                           # Phase 6 — Streamlit UI (7 pages)
 │   ├── streamlit_app.py
 │   └── api_client.py                    # HTTP only; reads no files
 ├── tests/                               # 102 tests
 │   ├── test_api.py  test_agents.py
 │   ├── test_registry.py  test_dashboard.py
+│   └── test_deployment.py               # single-process deploy path
 ├── runtime/                             # gitignored local state
 │   └── governance_registry.db           # rebuild: python -m app.registry.cli register
+├── streamlit_app.py                     # Cloud entry point: API in-process + dashboard
+├── .python-version                      # pins 3.13 for Streamlit Cloud
 ├── requirements.txt
 └── README.md
 ```
@@ -851,6 +860,105 @@ review endpoint would become unreachable. A test pins this.
 
 > Note: `evaluate.py` rewrites `results\model_metrics.csv` without the `fit_seconds`
 > column (it never trains, so it has no timings). Run `train.py` if you want that column.
+
+---
+
+## 3e. Deploying to Streamlit Community Cloud
+
+The platform normally runs as **two processes** (uvicorn + Streamlit). Streamlit
+Community Cloud runs **one process per app**, so a separately-launched API cannot
+exist there — deployed naively, every dashboard page would show *"API unavailable"*.
+
+The repository root therefore contains a deployment entry point,
+[`streamlit_app.py`](streamlit_app.py), which starts the API **in-process** on a
+background thread and then hands over to the unmodified dashboard.
+
+### What Cloud needs (all committed)
+
+| File | Purpose |
+|---|---|
+| `streamlit_app.py` | Entry point at the repo root — Cloud's default main file |
+| `requirements.txt` | Dependencies |
+| `.python-version` | Pins **3.13** (Cloud tops out below the 3.14 used locally) |
+
+### Deploy
+
+1. Go to **https://share.streamlit.io** and sign in with GitHub.
+2. **New app** → **Deploy from existing repo**.
+3. Repository `Nikhilreddy1867/project_kmit` · Branch `main` · Main file path
+   **`streamlit_app.py`** (the root one, not `dashboard/streamlit_app.py`).
+4. Under *Advanced settings*, confirm Python **3.13**.
+5. Deploy. First boot takes a few minutes while the dependencies install.
+
+### What the entry point does
+
+```text
+Cloud starts ONE process
+        │
+        ├─ app.embedded.ensure_api_running()   → uvicorn on 127.0.0.1:8000,
+        │                                        daemon thread, loopback only
+        ├─ app.embedded.ensure_registry()      → creates runtime/ registry
+        │                                        (gitignored, so absent on a
+        │                                         fresh clone). Idempotent.
+        └─ dashboard/streamlit_app.py :: main() → unchanged, still HTTP-only
+```
+
+**The data contract is unchanged.** The dashboard still fetches everything over HTTP
+through `api_client`, still reads no files and still imports nothing from `app/`.
+What changed is *who starts the server*, not how data reaches the UI — all the
+deployment glue lives in the root entry point so those files are byte-identical
+between local and deployed runs.
+
+### Local development is unaffected
+
+`ensure_api_running()` first probes port 8000 and **defers to an already-running
+server**, so the two-terminal workflow in §3b keeps working exactly as documented.
+You can also use the entry point locally to get both halves from one command:
+
+```powershell
+streamlit run streamlit_app.py        # API + dashboard in one process
+```
+
+### Deliberate design points
+
+- **Loopback only.** The embedded API binds `127.0.0.1`, so it is *not* publicly
+  reachable even though the Streamlit app is. This matters: `predictions/*.csv`
+  carry `sex` and `race` for all 9,769 test records, and a publicly-bound API would
+  serve them to anyone. A test asserts `0.0.0.0` never appears in `app/embedded.py`.
+- **Cold start.** The API becomes ready on the first page load (Streamlit executes
+  the script per session), which adds roughly 10–15 s to the very first render.
+  `ensure_api_running()` blocks until `/health` answers, so no page ever renders
+  against a half-started server.
+- **Registry auto-bootstrap.** `runtime/` is gitignored, so a fresh deployment has
+  no registry. The entry point registers one at boot; failure is logged and
+  non-fatal, degrading one page rather than breaking the app.
+- **Module caching.** The dashboard is imported once and cached in `sys.modules`.
+  Re-executing it on every rerun would rebuild its `@st.cache_data` functions and
+  make the cache miss on every click.
+
+### Known limitations of the deployed app
+
+- **`requirements.txt` installs the full ML stack** (`scikit-learn`, `xgboost`,
+  `matplotlib`, `ucimlrepo`) even though neither the API nor the dashboard imports
+  any of them — only `src/` does. Cloud reads the root `requirements.txt` and does
+  not support a separate deployment file, and trimming it would break the documented
+  local setup in §2. The cost is a slower first build, not incorrect behaviour.
+- **Ephemeral filesystem.** The registry database lives in the container and is
+  rebuilt on each cold start. Integrity checks still work; the run history does not
+  persist across restarts.
+- **Free-tier resources.** The audit scripts in `src/` are *not* meant to run on
+  Cloud — the evidence is committed and read-only. Only the API and dashboard run.
+
+### Verify the deployment path locally
+
+```powershell
+pytest tests\test_deployment.py -q
+```
+
+11 tests, and notably they need **no externally running server** — which is the
+whole point, since Cloud has none. They cover the embedded API start, idempotency,
+loopback binding, registry bootstrap and failure tolerance, the Python pin, and an
+end-to-end render of all seven pages against the in-process API.
 
 ---
 

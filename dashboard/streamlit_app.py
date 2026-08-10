@@ -1534,18 +1534,30 @@ def page_model_registry(base_url: str) -> None:
         return
 
     all_events = timeline.get("events") or []
-    shown = all_events[-25:]
+
+    # Collapse CONSECUTIVE same-type events instead of windowing. The event log is
+    # append-only, so repeated integrity checks pile up; a plain "last N" view
+    # pushed the registration event off the screen entirely. Collapsing keeps the
+    # whole history visible and short, and states the repeat count rather than
+    # hiding anything.
+    collapsed: list[tuple[dict[str, Any], int]] = []
+    for event in all_events:
+        if collapsed and collapsed[-1][0].get("event_type") == event.get("event_type"):
+            previous, count = collapsed[-1]
+            collapsed[-1] = (event, count + 1)  # keep the most recent occurrence
+        else:
+            collapsed.append((event, 1))
+
     st.caption(
-        f"{timeline.get('total_events', timeline.get('count'))} event(s) recorded"
-        + (f"; showing the most recent {len(shown)}." if len(shown) < len(all_events)
-           else ", oldest first.")
-        + f" {timeline.get('note')}"
+        f"{timeline.get('total_events', len(all_events))} event(s) recorded, oldest "
+        f"first; consecutive repeats are grouped. {timeline.get('note')}"
     )
-    for event in shown:
+    for event, count in collapsed:
         marker = "📄" if event.get("source") == "evidence" else "📒"
+        repeat = f" **×{count}** (most recent shown)" if count > 1 else ""
         st.markdown(
-            f"{marker} **{event.get('event_time')}** · `{event.get('event_type')}` "
-            f"— {event.get('detail')}"
+            f"{marker} **{event.get('event_time')}** · `{event.get('event_type')}`"
+            f"{repeat} — {event.get('detail')}"
         )
 
     render_provenance(base_url)
