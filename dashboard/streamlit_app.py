@@ -1,7 +1,7 @@
 """
 streamlit_app.py
 ================
-Local Streamlit dashboard for the AI Governance Platform (Phase 6).
+Local Streamlit dashboard for MAAT, the Multi-Agent AI Audit and Trust Framework.
 
 Run (with the API already running on port 8000):
 
@@ -12,18 +12,40 @@ Data contract
 **Every value displayed here is fetched over HTTP from the governance API.** This
 module opens no files, imports nothing from ``src/`` or ``app/``, and performs no
 metric arithmetic -- charts and tables render the numbers exactly as the API
-served them. Where the interface needs prose (interpretation caveats, the
-four-fifths framing, provenance, limitations), that text is also pulled from the
-API rather than restated here, so the dashboard cannot drift from the audits.
+served them. It reads no CSV, no JSON artefact, no SQLite database, no model file
+and no results directory: if a figure is on screen, an endpoint served it. Where
+the interface needs prose (interpretation caveats, the four-fifths framing,
+provenance, limitations), that text is also pulled from the API rather than
+restated here, so the dashboard cannot drift from the audits.
+
+The one deliberate exception is :data:`JOBLIB_WARNING`, for the reason given at
+its definition.
 
 The only client-side computation is chart layout: bar positions and axis ranges.
 Notably the confusion matrix is displayed as **raw counts only** -- no row
 normalisation, no derived percentages -- because deriving a rate here would be
 recomputing a metric the audit already owns.
+
+Two kinds of record
+-------------------
+The first seven pages read the **built-in Adult Income reference case**: committed
+evidence, read-only, unaffected by anything a user submits. The last three are the
+**model-intake flow** over user-submitted runs, whose evidence lives under
+``runtime/``. The sidebar states which of the two is in view, because presenting
+them as one audit would misrepresent both.
+
+Writes
+------
+The intake pages POST to ``/api/onboarding`` and ``/api/gates`` only, and
+:mod:`api_client` refuses any other write path client-side as well. Creating an
+audit run, recording or revoking a waiver and re-evaluating a policy are the only
+state changes reachable from this dashboard; none of them can touch the reference
+case.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -39,9 +61,22 @@ from api_client import (  # noqa: E402
     ApiError,
     ApiMalformed,
     ApiNotFound,
+    ApiRejected,
     ApiServerError,
     ApiUnavailable,
     GovernanceApiClient,
+)
+
+#: Stated here as a literal, and it is the **one** exception to this module's rule
+#: that all prose arrives over the API. The warning has to appear before the user
+#: selects a file, i.e. before any request has been made -- and a security warning
+#: that is only shown if a server happens to answer is not a security warning. The
+#: API returns the same text in its validation response, and
+#: :func:`render_security_gate` compares the two and says so if they ever diverge.
+JOBLIB_WARNING = (
+    "Joblib files may execute arbitrary code. Upload only models from trusted "
+    "sources. This local academic prototype must not accept untrusted model files "
+    "in production."
 )
 
 PAGES = [
@@ -52,7 +87,15 @@ PAGES = [
     "Governance Decision & Risks",
     "Agent Review",
     "Model Registry",
+    "New Model Audit",
+    "Uploaded Audit Runs",
+    "Policy Gates & Conformity Bundle",
 ]
+
+#: Pages 1-7 read the built-in Adult Income reference case; pages 8-10 are the
+#: model-intake flow over user-submitted runs. The split is stated in the sidebar
+#: because the two are separate records and must not be read as one audit.
+REFERENCE_PAGES = frozenset(PAGES[:7])
 
 st.set_page_config(
     page_title="AI Governance Platform",
@@ -177,8 +220,10 @@ def fetch_agent_review(base_url: str, model: str) -> dict[str, Any]:
 # Registry fetches use a short TTL: integrity is a live check, so a stale cached
 # "verified" would be actively misleading.
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_registry_runs(base_url: str, status: str | None = None) -> dict[str, Any]:
-    return GovernanceApiClient(base_url).registry_runs(status=status)
+def fetch_registry_runs(
+    base_url: str, status: str | None = None, run_type: str | None = None
+) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).registry_runs(status=status, run_type=run_type)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -196,13 +241,113 @@ def fetch_registry_timeline(base_url: str, run_id: str) -> dict[str, Any]:
     return GovernanceApiClient(base_url).registry_timeline(run_id)
 
 
+# Uploaded-run reads use a 15s TTL. These runs change during a session -- a waiver
+# is recorded, the gates are re-evaluated -- so a long cache would show a reviewer
+# a verdict that has already been superseded. The write helpers below clear the
+# cache outright rather than relying on the TTL to expire.
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_uploaded_audits(base_url: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).uploaded_audits()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_uploaded_audit(base_url: str, run_id: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).uploaded_audit(run_id)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_uploaded_performance(base_url: str, run_id: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).uploaded_performance(run_id)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_uploaded_fairness(base_url: str, run_id: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).uploaded_fairness(run_id)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_uploaded_explainability(base_url: str, run_id: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).uploaded_explainability(run_id)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_uploaded_governance(base_url: str, run_id: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).uploaded_governance(run_id)
+
+
+# Integrity is a live check: a cached "verified" would be actively misleading, so
+# this is the shortest TTL in the app.
+@st.cache_data(ttl=5, show_spinner=False)
+def fetch_uploaded_integrity(base_url: str, run_id: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).uploaded_integrity(run_id)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_uploaded_timeline(base_url: str, run_id: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).uploaded_timeline(run_id)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_policies(base_url: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).policies()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_gate_evaluation(base_url: str, run_id: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).gate_evaluation(run_id)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_conformity_bundle(base_url: str, run_id: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).conformity_bundle(run_id)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_traceability(base_url: str, run_id: str) -> dict[str, Any]:
+    return GovernanceApiClient(base_url).traceability(run_id)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_waivers(base_url: str, run_id: str) -> list[dict[str, Any]]:
+    return GovernanceApiClient(base_url).waivers(run_id)
+
+
 # --------------------------------------------------------------------------- #
 # Error rendering
 # --------------------------------------------------------------------------- #
+def render_issues(issues: list[dict[str, Any]] | None) -> None:
+    """
+    Render the API's validation issues, errors first.
+
+    Warnings are shown alongside errors rather than hidden: "ROC-AUC will not be
+    available because this model has no predict_proba" is not an error, but a
+    submitter who does not see it will be surprised by the audit that results.
+    """
+    if not issues:
+        return
+    errors = [i for i in issues if i.get("severity") == "error"]
+    warnings = [i for i in issues if i.get("severity") != "error"]
+    for issue in errors + warnings:
+        marker = "🔴" if issue.get("severity") == "error" else "⚠️"
+        field = f" · `{issue['field']}`" if issue.get("field") else ""
+        st.markdown(
+            f"{marker} **`{issue.get('code')}`**{field} — {issue.get('message')}"
+        )
+        if issue.get("hint"):
+            st.caption(f"↳ {issue['hint']}")
+
+
 def show_api_error(exc: ApiError, context: str = "") -> None:
     """Render a typed API failure as a specific, actionable message."""
     prefix = f"**{context}** — " if context else ""
-    if isinstance(exc, ApiUnavailable):
+    if isinstance(exc, ApiRejected):
+        # Not a malfunction: the API understood the submission and refused it. Shown
+        # as something to fix, with every issue listed so one round trip is enough.
+        st.error(f"{prefix}Refused. {exc.message}", icon="🚫")
+        if exc.code:
+            st.caption(f"Reason code: `{exc.code}`")
+        render_issues(exc.issues)
+    elif isinstance(exc, ApiUnavailable):
         st.error(f"{prefix}API unavailable. {exc.message}", icon="🔌")
     elif isinstance(exc, ApiNotFound):
         st.warning(f"{prefix}Not available. {exc.message}", icon="🚫")
@@ -247,10 +392,21 @@ def split_markdown_sections(markdown: str) -> dict[str, str]:
 # Sidebar
 # --------------------------------------------------------------------------- #
 def render_sidebar() -> tuple[str, str]:
-    st.sidebar.title("⚖️ AI Governance Platform")
-    st.sidebar.caption("Phase 6 dashboard · read-only view of the Adult Income audit")
+    st.sidebar.title("⚖️ MAAT")
+    st.sidebar.caption(
+        "Multi-Agent AI Audit and Trust Framework · local academic prototype"
+    )
 
     page = st.sidebar.radio("Page", PAGES, key="page")
+    if page in REFERENCE_PAGES:
+        st.sidebar.caption(
+            "📄 **Reference case** — the built-in Adult Income audit, read-only."
+        )
+    else:
+        st.sidebar.caption(
+            "📥 **User-submitted audits** — separate records, written under `runtime/`. "
+            "They do not affect the reference case or its decision."
+        )
 
     st.sidebar.divider()
     base_url = st.sidebar.text_input(
@@ -286,8 +442,10 @@ def render_sidebar() -> tuple[str, str]:
 
     st.sidebar.divider()
     st.sidebar.caption(
-        "All figures are served by the API from the committed audit artefacts. "
-        "This dashboard reads no files and recalculates nothing."
+        "Every figure is served by the API — from the committed audit artefacts for "
+        "the reference case, and from the run's own `runtime/` artefacts for an "
+        "uploaded audit. This dashboard opens no file, reads no database and "
+        "recalculates nothing."
     )
     return page, base_url
 
@@ -1304,8 +1462,15 @@ def page_model_registry(base_url: str) -> None:
     )
 
     # --- run list ---------------------------------------------------------- #
+    #
+    # Scoped to reference-case runs. The registry holds both kinds of run, but this
+    # page is the reference case's record: an unfiltered list would put whichever
+    # upload happens to be newest in the default selection, so the Adult Income
+    # evidence a reviewer came here for would depend on who uploaded what today.
+    # Uploaded audits have their own page, and the count below says how many exist
+    # so their absence here is visible rather than silent.
     try:
-        listing = fetch_registry_runs(base_url)
+        listing = fetch_registry_runs(base_url, run_type="reference_case")
     except ApiServerError as exc:
         # A 503 here means the registry has not been created yet -- an actionable
         # setup step, so show the exact command rather than a generic error.
@@ -1342,10 +1507,17 @@ def page_model_registry(base_url: str) -> None:
         return
 
     st.subheader("Audit runs")
-    cols = st.columns(3)
+    uploaded_ids = listing.get("uploaded_run_ids") or []
+    cols = st.columns(4)
     cols[0].metric("Registered runs", _fmt(listing.get("count")))
     cols[1].metric("Active run", listing.get("active_run_id") or "none")
-    cols[2].metric("Database", str(listing.get("database")))
+    cols[2].metric("Uploaded runs", _fmt(len(uploaded_ids)))
+    cols[3].metric("Database", str(listing.get("database")))
+    st.caption(
+        "Reference-case runs only. The registry also holds "
+        f"{len(uploaded_ids)} uploaded-model run(s); those are shown on the "
+        "**Uploaded Audit Runs** page. Neither kind of run supersedes the other."
+    )
     st.dataframe(runs, width="stretch", hide_index=True)
 
     labels = [
@@ -1564,6 +1736,1349 @@ def page_model_registry(base_url: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Shared blocks for user-submitted audits
+# --------------------------------------------------------------------------- #
+GATE_STYLE = {
+    "PASS": ("✅", "success"),
+    "WAIVE": ("🟡", "warning"),
+    "BLOCK": ("⛔", "error"),
+    "NOT_EVALUATED": ("⚪", "info"),
+}
+
+GOVERNANCE_STYLE = {
+    "review_required": ("📋", "warning"),
+    "insufficient_evidence": ("❔", "warning"),
+    "blocked_by_policy": ("⛔", "error"),
+}
+
+FAIRNESS_STATUS_STYLE = {
+    "assessed": "📊",
+    "not_provided_by_user": "➖",
+    "not_available": "❔",
+}
+
+
+def render_intake_notice() -> None:
+    """The standing framing for every user-submitted audit page."""
+    st.info(
+        "**These are user-submitted audit runs, separate from the built-in Adult "
+        "Income reference case.** Everything they produce is written under "
+        "`runtime/` and is deterministic decision-support evidence for human review "
+        "— not a legal compliance assessment, not proof of discrimination, not a "
+        "causal claim, and not authorisation to deploy anything.",
+        icon="📥",
+    )
+
+
+#: Fallback for the production-hardening note, used only before any request has
+#: been made. Once the API has answered, its own ``production_hardening`` text is
+#: shown instead -- the same API-first rule as every other piece of prose here.
+PRODUCTION_HARDENING_FALLBACK = (
+    "A production implementation must not deserialise user-supplied pickles in the "
+    "application process. It should run model loading and inference inside an "
+    "isolated sandbox (a separate container or VM, no network egress, read-only "
+    "filesystem, dropped privileges, CPU/memory limits) and prefer formats that do "
+    "not carry executable payloads — ONNX for the computation graph, or skops, which "
+    "reconstructs scikit-learn estimators from an allow-list of types instead of "
+    "executing arbitrary opcodes. This prototype does neither: it loads the uploaded "
+    "model in-process, which is acceptable only because the operator is also the "
+    "person supplying the file."
+)
+
+
+def render_security_gate(
+    api_warning: str | None = None, hardening: str | None = None
+) -> None:
+    """
+    The joblib warning, stated in full, plus what the prototype does about it.
+
+    ``api_warning`` is the text the API returned for a submission that has already
+    been made. When present it is compared with the local copy: if the two ever
+    diverge, the discrepancy is shown rather than quietly resolved in favour of
+    either one. ``hardening`` is the API's production-hardening note, preferred over
+    :data:`PRODUCTION_HARDENING_FALLBACK` whenever it has been served.
+    """
+    st.error(f"**⚠️ {JOBLIB_WARNING}**", icon="⚠️")
+    if api_warning and api_warning.strip() != JOBLIB_WARNING:
+        st.warning(
+            "**The warning text served by the API differs from the one shown above.** "
+            "Treat both as authoritative until the discrepancy is explained.\n\n"
+            f"API text: {api_warning}",
+            icon="🧩",
+        )
+    with st.expander("What this prototype does about that risk", expanded=False):
+        st.markdown(
+            "- Only `.joblib` is accepted. `.py`, `.pkl`, `.pickle`, archives, "
+            "executables and remote URLs are refused **before** anything is stored.\n"
+            "- The file is never deserialised until the acknowledgement has been "
+            "given and the dataset has passed structural validation, so a model "
+            "that was never going to be auditable is rejected without being loaded.\n"
+            "- The acknowledgement is recorded in the audit run's manifest.\n"
+            "- Uploads are stored under `runtime/uploads/<upload_id>/` with a "
+            "generated UUID filename. Your original filename is kept as a label "
+            "only and is never used as a filesystem path. No upload can overwrite "
+            "an existing file."
+        )
+        st.markdown("**Production hardening**")
+        st.markdown(hardening or PRODUCTION_HARDENING_FALLBACK)
+
+
+def uploaded_run_selector(base_url: str, key: str) -> str | None:
+    """
+    Shared run picker for the two uploaded-run pages.
+
+    Returns ``None`` when there is nothing to select, having already explained what
+    to do about it. The last choice is remembered in ``selected_uploaded_run`` so
+    moving between the two pages keeps the same run in view.
+    """
+    try:
+        listing = fetch_uploaded_audits(base_url)
+    except ApiError as exc:
+        show_api_error(exc, "Uploaded audit runs")
+        return None
+
+    runs = listing.get("runs") or []
+    if not runs:
+        st.warning(
+            "**No user-submitted audit runs yet.** Open **New Model Audit** in the "
+            "sidebar to submit a trusted local `.joblib` model and a labelled CSV.",
+            icon="📭",
+        )
+        return None
+
+    labels = [
+        f"{GOVERNANCE_STYLE.get(str(r.get('governance_state')), ('•', ''))[0]} "
+        f"{r.get('audit_run_id')} · {r.get('model_name')} v{r.get('model_version')} "
+        f"· {r.get('created_at')}"
+        for r in runs
+    ]
+    remembered = st.session_state.get("selected_uploaded_run")
+    ids = [str(r.get("audit_run_id")) for r in runs]
+    index = ids.index(remembered) if remembered in ids else 0
+    choice = st.selectbox(
+        f"Audit run ({listing.get('count')} recorded, newest first)",
+        labels,
+        index=index,
+        key=key,
+    )
+    run_id = ids[labels.index(choice)]
+    st.session_state["selected_uploaded_run"] = run_id
+    return run_id
+
+
+def render_gate_row(gate_summary: dict[str, str]) -> None:
+    """The five gates as one row, in policy order."""
+    order = ["DG", "TG", "VG", "RG", "OG"]
+    present = [g for g in order if g in gate_summary] + [
+        g for g in gate_summary if g not in order
+    ]
+    cols = st.columns(len(present) or 1)
+    for col, gate in zip(cols, present):
+        status = str(gate_summary.get(gate))
+        icon, _ = GATE_STYLE.get(status, ("❔", "info"))
+        col.metric(gate, f"{icon} {status}")
+
+
+def render_governance_banner(governance: dict[str, Any]) -> None:
+    """The run's governance state, with the API's own meaning and grounds."""
+    state = str(governance.get("governance_state"))
+    icon, kind = GOVERNANCE_STYLE.get(state, ("❔", "warning"))
+    getattr(st, kind)(
+        f"#### {icon} {state.replace('_', ' ').upper()}\n"
+        f"{governance.get('state_meaning', '')}",
+        icon=icon,
+    )
+    cols = st.columns(2)
+    cols[0].metric(
+        "Human review required",
+        "✅ always" if governance.get("human_review_required") else "—",
+    )
+    cols[1].metric(
+        "Deployment authorisation",
+        str(governance.get("deployment_authorisation", "not_granted")).replace("_", " "),
+    )
+    if governance.get("state_grounds"):
+        st.markdown("**Grounds for this state**")
+        for ground in governance["state_grounds"]:
+            st.markdown(f"- {ground}")
+
+
+# --------------------------------------------------------------------------- #
+# Page 8 — New Model Audit
+#
+# Two phases, because the dashboard must not parse the uploaded CSV itself. The
+# column names, target classes and model capabilities that populate the phase-2
+# controls all arrive from POST /api/onboarding/validate -- so the dropdowns are
+# built from what the API read, not from anything computed here.
+# --------------------------------------------------------------------------- #
+def page_new_audit(base_url: str) -> None:
+    st.title("New model audit")
+    st.caption(
+        "Submit a trusted local `.joblib` binary classifier and a labelled CSV to "
+        "create a new governance audit run."
+    )
+    render_intake_notice()
+
+    st.subheader("1 · Files and security acknowledgement")
+    _seen = st.session_state.get("intake_validation") or {}
+    render_security_gate(
+        _seen.get("security_warning"), _seen.get("production_hardening")
+    )
+
+    left, right = st.columns(2)
+    with left:
+        model_file = st.file_uploader(
+            "Model file",
+            type=None,
+            key="intake_model_file",
+            help="A scikit-learn estimator or fitted Pipeline saved with joblib.dump.",
+        )
+        st.caption(
+            "Only `.joblib` is accepted. The uploader is deliberately unrestricted so "
+            "that the refusal is visible: anything else is rejected by the API before "
+            "it is stored or opened."
+        )
+    with right:
+        dataset_file = st.file_uploader(
+            "Labelled dataset (.csv)",
+            type=["csv"],
+            key="intake_dataset_file",
+            help="Must contain the ground-truth label column and the model's input "
+            "features. Sensitive columns need not be model features.",
+        )
+
+    acknowledged = st.checkbox(
+        "I have read the warning above. This model file comes from a source I trust, "
+        "and I accept that loading it executes code in this process.",
+        key="intake_ack",
+    )
+
+    st.subheader("2 · Target configuration")
+    st.caption(
+        "The target column and positive class are needed before the CSV can be read, "
+        "so type them here. The remaining choices are offered as lists once the API "
+        "has profiled the file."
+    )
+    cfg_l, cfg_r = st.columns(2)
+    target_column = cfg_l.text_input(
+        "Target column", key="intake_target", placeholder="e.g. income"
+    ).strip()
+    positive_class = cfg_r.text_input(
+        "Positive class", key="intake_positive", placeholder="e.g. >50K"
+    ).strip()
+
+    validate_clicked = st.button(
+        "🔍 Validate submission",
+        type="primary",
+        disabled=not (model_file and dataset_file and target_column and positive_class),
+        help="Uploads both files and runs every intake check. No audit run is created.",
+    )
+
+    if validate_clicked:
+        client = GovernanceApiClient(base_url)
+        with st.spinner("Uploading and validating…"):
+            try:
+                validation = client.validate_upload(
+                    model_name=model_file.name,
+                    model_bytes=model_file.getvalue(),
+                    dataset_name=dataset_file.name,
+                    dataset_bytes=dataset_file.getvalue(),
+                    target_column=target_column,
+                    positive_class=positive_class,
+                    # Fairness columns are chosen in phase 3 from the profiled
+                    # column list, so this first pass asks for none.
+                    sensitive_columns=[],
+                    security_acknowledged=acknowledged,
+                )
+            except ApiError as exc:
+                st.session_state.pop("intake_validation", None)
+                show_api_error(exc, "Validation")
+                return
+        st.session_state["intake_validation"] = validation
+        st.session_state.pop("intake_result", None)
+
+    validation = st.session_state.get("intake_validation")
+    if not validation:
+        st.caption(
+            "Nothing has been uploaded yet. Validation stores the two files under "
+            "`runtime/uploads/` and creates no audit run."
+        )
+        return
+
+    # --- validation report -------------------------------------------------- #
+    st.divider()
+    st.subheader("Validation report")
+    if validation.get("valid"):
+        st.success(
+            f"**Ready to audit.** Upload id `{validation.get('upload_id')}`.",
+            icon="✅",
+        )
+    else:
+        st.error(
+            "**Not ready.** Fix every error below and validate again. No audit run "
+            "has been created.",
+            icon="🚫",
+        )
+    render_issues(validation.get("issues"))
+    st.caption(validation.get("next_step", ""))
+
+    capabilities = validation.get("audit_capabilities") or {}
+    cols = st.columns(len(capabilities) or 1)
+    for col, (name, available) in zip(cols, capabilities.items()):
+        col.metric(
+            name.replace("_", " "), "✅ yes" if available else "❌ no"
+        )
+    st.caption(
+        "An unavailable capability is reported honestly and stays unavailable: no "
+        "substitute model is trained, no probability is synthesised, and no "
+        "importance score is invented."
+    )
+
+    profile = validation.get("dataset") or {}
+    caps = validation.get("model_capabilities") or {}
+    compat = validation.get("feature_compatibility") or {}
+
+    prof_tab, model_tab, compat_tab = st.tabs(
+        ["Dataset profile", "Model capabilities", "Feature compatibility"]
+    )
+    with prof_tab:
+        cols = st.columns(4)
+        cols[0].metric("Rows", _fmt(profile.get("row_count")))
+        cols[1].metric("Columns", _fmt(profile.get("column_count")))
+        cols[2].metric("Target classes", _fmt(len(profile.get("target_classes") or [])))
+        cols[3].metric(
+            "Positive rows", _fmt(profile.get("positive_class_count"))
+        )
+        st.markdown(
+            "**Class counts:** "
+            + ", ".join(
+                f"`{k}` = {v:,}"
+                for k, v in (profile.get("target_class_counts") or {}).items()
+            )
+        )
+        st.caption("Columns: " + ", ".join(f"`{c}`" for c in profile.get("columns") or []))
+        if profile.get("duplicate_columns"):
+            st.error(
+                "Duplicate column names: "
+                + ", ".join(f"`{c}`" for c in profile["duplicate_columns"]),
+                icon="🔴",
+            )
+    with model_tab:
+        cols = st.columns(4)
+        cols[0].metric("Loaded", _fmt(caps.get("loaded")))
+        cols[1].metric("Binary classifier", _fmt(caps.get("is_binary_classifier")))
+        cols[2].metric("predict_proba", _fmt(caps.get("has_predict_proba")))
+        cols[3].metric("Pipeline", _fmt(caps.get("is_pipeline")))
+        st.markdown(
+            f"- Estimator: `{caps.get('estimator_type')}` "
+            f"from `{caps.get('estimator_module')}`\n"
+            f"- Final estimator: `{caps.get('final_estimator')}`\n"
+            f"- Pipeline steps: "
+            + ", ".join(f"`{s}`" for s in caps.get("pipeline_steps") or ["—"])
+            + f"\n- Classes: "
+            + ", ".join(f"`{c}`" for c in caps.get("classes") or [])
+            + f"\n- Permutation importance: {_fmt(caps.get('supports_permutation_importance'))}"
+            f"\n- Local TreeSHAP: {_fmt(caps.get('supports_treeshap'))}"
+        )
+        if not caps.get("has_predict_proba"):
+            st.warning(
+                "No `predict_proba`. ROC-AUC will be reported as unavailable with the "
+                "reason stated, the decision threshold will not be applied, and no "
+                "probability will be estimated.",
+                icon="⚠️",
+            )
+    with compat_tab:
+        cols = st.columns(3)
+        cols[0].metric("Checked", _fmt(compat.get("checked")))
+        cols[1].metric("Compatible", _fmt(compat.get("compatible")))
+        cols[2].metric("Matched features", _fmt(compat.get("matched_feature_count")))
+        st.caption(f"Method: {compat.get('method')}")
+        if compat.get("missing_features"):
+            st.error(
+                "**Missing from the CSV** (the model expects these): "
+                + ", ".join(f"`{c}`" for c in compat["missing_features"]),
+                icon="🔴",
+            )
+        if compat.get("unexpected_features"):
+            st.info(
+                "**In the CSV but not expected by the model:** "
+                + ", ".join(f"`{c}`" for c in compat["unexpected_features"]),
+                icon="ℹ️",
+            )
+        if compat.get("sensitive_columns_retained"):
+            st.caption(
+                "Retained for fairness reporting even though they are not model "
+                "features: "
+                + ", ".join(f"`{c}`" for c in compat["sensitive_columns_retained"])
+            )
+
+    if not validation.get("valid") or not validation.get("upload_id"):
+        return
+
+    # --- phase 3: configure and run ----------------------------------------- #
+    st.divider()
+    st.subheader("3 · Fairness columns, threshold and model metadata")
+
+    columns = [c for c in profile.get("columns") or [] if c != target_column]
+    classes = [str(c) for c in profile.get("target_classes") or []]
+
+    with st.form("intake_create"):
+        sensitive_columns = st.multiselect(
+            "Sensitive columns for fairness reporting",
+            columns,
+            help="Fairness is computed only for the columns you select here. "
+            "Selecting none is allowed and yields status "
+            "'not_provided_by_user' — which is not a pass and not a fairness claim.",
+        )
+        col_a, col_b = st.columns(2)
+        chosen_positive = col_a.selectbox(
+            "Positive class",
+            classes,
+            index=classes.index(positive_class) if positive_class in classes else 0,
+        )
+        threshold = col_b.slider(
+            "Decision threshold",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.50,
+            step=0.01,
+            help="Applied to predicted probabilities. Reported as not applied for a "
+            "predict-only model.",
+        )
+
+        meta_l, meta_r = st.columns(2)
+        model_name = meta_l.text_input("Model name", value=Path(model_file.name).stem)
+        model_version = meta_r.text_input("Model version", value="unspecified")
+        model_owner = st.text_input(
+            "Accountable owner",
+            help="The person or team answerable for this model. Recorded in the "
+            "Conformity Bundle.",
+        )
+        intended_use = st.text_area(
+            "Intended use",
+            help="What this model is for. Recorded as evidence, not evaluated.",
+        )
+        decision_context = st.text_area(
+            "Decision context",
+            help="What decisions this model would inform, and about whom.",
+        )
+        submitted = st.form_submit_button("🚀 Create audit run", type="primary")
+
+    if submitted:
+        missing = [
+            label
+            for label, value in (
+                ("model name", model_name),
+                ("model version", model_version),
+                ("accountable owner", model_owner),
+                ("intended use", intended_use),
+                ("decision context", decision_context),
+            )
+            if not str(value).strip()
+        ]
+        if missing:
+            # Checked here as well as server-side so the user is not made to wait
+            # for an upload round trip to be told a text box is empty.
+            st.error(
+                "Provide: " + ", ".join(missing) + ". These are the accountability "
+                "fields recorded in the Conformity Bundle, so none of them is "
+                "defaulted for you.",
+                icon="🚫",
+            )
+            return
+        client = GovernanceApiClient(base_url)
+        with st.spinner("Running inference, fairness, explainability and the gates…"):
+            try:
+                result = client.create_audit(
+                    target_column=target_column,
+                    positive_class=chosen_positive,
+                    decision_threshold=threshold,
+                    sensitive_columns=sensitive_columns,
+                    security_acknowledged=acknowledged,
+                    upload_id=str(validation["upload_id"]),
+                    model_metadata={
+                        "model_name": model_name.strip(),
+                        "model_version": model_version.strip(),
+                        "model_owner": model_owner.strip(),
+                        "intended_use": intended_use.strip(),
+                        "decision_context": decision_context.strip(),
+                    },
+                )
+            except ApiError as exc:
+                show_api_error(exc, "Audit run")
+                return
+        st.cache_data.clear()  # the new run must appear immediately
+        st.session_state["intake_result"] = result
+        st.session_state["selected_uploaded_run"] = result["audit_run_id"]
+
+    result = st.session_state.get("intake_result")
+    if not result:
+        return
+
+    st.divider()
+    st.subheader("Audit run created")
+    st.success(
+        f"**`{result['audit_run_id']}`** — written under `{result['written_under']}`.",
+        icon="✅",
+    )
+    cols = st.columns(4)
+    cols[0].metric("Governance state", str(result.get("governance_state")))
+    cols[1].metric("Fairness", str(result.get("fairness_status")))
+    cols[2].metric("Explainability", str(result.get("explainability_status")))
+    cols[3].metric("Artefacts", _fmt(result.get("artifact_count")))
+    render_gate_row(result.get("gate_summary") or {})
+    st.markdown(
+        f"- Conformity Bundle: `{result.get('conformity_bundle_id')}`\n"
+        f"- Registry run: `{result.get('registry_run_id') or 'not registered'}`"
+    )
+    render_issues(result.get("warnings"))
+    st.info(result.get("next_step", ""), icon="➡️")
+    st.caption(
+        "Open **Uploaded Audit Runs** for the full evidence, or **Policy Gates & "
+        "Conformity Bundle** for the gate decisions and traceability matrix. "
+        f"{result.get('notice', '')}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Page 9 — Uploaded Audit Runs
+# --------------------------------------------------------------------------- #
+def page_uploaded_audits(base_url: str) -> None:
+    st.title("Uploaded audit runs")
+    st.caption(
+        "Evidence for each user-submitted model, served from that run's own "
+        "artefacts under `runtime/audits/`."
+    )
+    render_intake_notice()
+
+    run_id = uploaded_run_selector(base_url, key="uploaded_run_pick")
+    if run_id is None:
+        return
+
+    try:
+        detail = fetch_uploaded_audit(base_url, run_id)
+    except ApiError as exc:
+        show_api_error(exc, f"Run {run_id}")
+        return
+
+    metadata = detail.get("model_metadata") or {}
+    dataset = detail.get("dataset_metadata") or {}
+    target = detail.get("target_configuration") or {}
+
+    st.divider()
+    cols = st.columns(4)
+    cols[0].metric("Governance state", str(detail.get("governance_state")))
+    cols[1].metric("Rows audited", _fmt(dataset.get("row_count")))
+    cols[2].metric("Threshold", _fmt(dataset.get("decision_threshold"), 2))
+    cols[3].metric("Artefacts", _fmt(len(detail.get("artifacts") or [])))
+
+    tabs = st.tabs(
+        [
+            "Submission",
+            "Performance",
+            "Fairness",
+            "Explainability",
+            "Governance & risks",
+            "Evidence integrity",
+            "Timeline",
+        ]
+    )
+
+    # --- submission --------------------------------------------------------- #
+    with tabs[0]:
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Model**")
+            st.markdown(
+                f"- Name: `{metadata.get('model_name')}` "
+                f"v`{metadata.get('model_version')}`\n"
+                f"- Accountable owner: {metadata.get('model_owner')}\n"
+                f"- SHA-256: `{detail.get('model_checksum')}`"
+            )
+            st.caption(f"**Intended use:** {metadata.get('intended_use', '—')}")
+            st.caption(f"**Decision context:** {metadata.get('decision_context', '—')}")
+        with right:
+            st.markdown("**Dataset**")
+            st.markdown(
+                f"- Label: `{dataset.get('original_filename_label', '—')}`\n"
+                f"- Rows × columns: {_fmt(dataset.get('row_count'))} × "
+                f"{_fmt(dataset.get('column_count'))}\n"
+                f"- SHA-256: `{detail.get('dataset_checksum')}`"
+            )
+            st.markdown("**Target configuration**")
+            st.markdown(
+                f"- Target column: `{target.get('target_column')}`\n"
+                f"- Positive class: `{target.get('positive_class')}`\n"
+                f"- Sensitive columns: "
+                + (
+                    ", ".join(f"`{c}`" for c in target.get("sensitive_columns") or [])
+                    or "_none selected_"
+                )
+            )
+
+        st.markdown("**Security**")
+        cols = st.columns(2)
+        cols[0].metric(
+            "Warning acknowledged", _fmt(detail.get("security_acknowledged"))
+        )
+        cols[1].metric("Upload id", str(detail.get("upload_id"))[:12] + "…")
+        render_security_gate(detail.get("security_warning"))
+
+        st.markdown("**Audit coverage**")
+        coverage = detail.get("audit_coverage") or {}
+        cols = st.columns(len(coverage) or 1)
+        for col, (name, available) in zip(cols, coverage.items()):
+            col.metric(name.replace("_", " "), "✅ yes" if available else "❌ no")
+
+        with st.expander("Model capabilities and feature compatibility", expanded=False):
+            st.json(detail.get("model_capabilities") or {}, expanded=False)
+            st.json(detail.get("feature_compatibility") or {}, expanded=False)
+        with st.expander("Artefacts written for this run", expanded=False):
+            st.dataframe(
+                detail.get("artifacts") or [], width="stretch", hide_index=True
+            )
+        render_caveats(detail.get("limitations"), "Limitations of this audit run")
+
+    # --- performance -------------------------------------------------------- #
+    with tabs[1]:
+        try:
+            performance = fetch_uploaded_performance(base_url, run_id)
+        except ApiError as exc:
+            show_api_error(exc, "Performance")
+        else:
+            cols = st.columns(5)
+            cols[0].metric("Accuracy", _fmt(performance.get("accuracy")))
+            cols[1].metric("Precision", _fmt(performance.get("precision")))
+            cols[2].metric("Recall", _fmt(performance.get("recall")))
+            cols[3].metric("F1", _fmt(performance.get("f1")))
+            cols[4].metric("ROC-AUC", _fmt(performance.get("roc_auc")))
+            if performance.get("roc_auc") is None:
+                st.warning(
+                    f"**ROC-AUC unavailable.** "
+                    f"{performance.get('roc_auc_unavailable_reason', '')}",
+                    icon="⚠️",
+                )
+            st.caption(
+                f"{_fmt(performance.get('n_samples'))} rows · positive class "
+                f"`{performance.get('positive_class')}` · threshold "
+                f"{_fmt(performance.get('decision_threshold'), 2)} "
+                f"({'applied' if performance.get('threshold_applied') else 'not applied'})"
+                f" · {performance.get('computed_from', '')}"
+            )
+
+            matrix = performance.get("confusion_matrix") or {}
+            fig = go.Figure(
+                go.Bar(
+                    x=["TN", "FP", "FN", "TP"],
+                    y=[
+                        matrix.get("true_negatives", 0),
+                        matrix.get("false_positives", 0),
+                        matrix.get("false_negatives", 0),
+                        matrix.get("true_positives", 0),
+                    ],
+                    marker_color=[BASELINE, C_NEGATIVE, C_NEGATIVE, C_SELECTION],
+                    text=[
+                        f"{matrix.get(k, 0):,}"
+                        for k in (
+                            "true_negatives",
+                            "false_positives",
+                            "false_negatives",
+                            "true_positives",
+                        )
+                    ],
+                    textposition="outside",
+                    hovertemplate="%{x}: %{y:,} rows<extra></extra>",
+                )
+            )
+            st.plotly_chart(
+                _style(fig, height=320, y_title="Rows (raw counts)"), width="stretch"
+            )
+            st.caption(
+                "Raw counts exactly as the audit computed them — no normalisation "
+                "and no derived rates, which the audit already owns."
+            )
+            render_caveats(performance.get("caveats"), "Performance caveats")
+
+    # --- fairness ----------------------------------------------------------- #
+    with tabs[2]:
+        try:
+            fairness = fetch_uploaded_fairness(base_url, run_id)
+        except ApiError as exc:
+            show_api_error(exc, "Fairness")
+        else:
+            status = str(fairness.get("status"))
+            marker = FAIRNESS_STATUS_STYLE.get(status, "❔")
+            if status == "not_provided_by_user":
+                st.info(
+                    f"#### {marker} {status}\n{fairness.get('status_detail', '')}",
+                    icon="➖",
+                )
+            elif status == "assessed":
+                st.success(
+                    f"#### {marker} Fairness assessed\n"
+                    f"{fairness.get('status_detail', '')}",
+                    icon="📊",
+                )
+            else:
+                st.warning(
+                    f"#### {marker} {status}\n{fairness.get('status_detail', '')}",
+                    icon="❔",
+                )
+
+            st.caption(
+                "Requested columns: "
+                + (
+                    ", ".join(
+                        f"`{c}`" for c in fairness.get("sensitive_columns_requested") or []
+                    )
+                    or "none"
+                )
+                + f" · reference group rule: {fairness.get('reference_group_rule')}"
+                + f" · small-group threshold: n < "
+                f"{_fmt(fairness.get('small_group_threshold'))}"
+            )
+
+            for attribute in fairness.get("attributes") or []:
+                st.markdown(f"#### `{attribute.get('attribute')}`")
+                cols = st.columns(4)
+                cols[0].metric("Groups", _fmt(attribute.get("n_groups")))
+                cols[1].metric(
+                    "Reference",
+                    f"{attribute.get('reference_group')} "
+                    f"(n={_fmt(attribute.get('reference_n'))})",
+                )
+                cols[2].metric(
+                    "Min disparate impact ratio",
+                    _fmt(attribute.get("min_disparate_impact_ratio")),
+                )
+                cols[3].metric(
+                    "Max |equal opportunity diff|",
+                    _fmt(attribute.get("max_abs_equal_opportunity_difference")),
+                )
+                if attribute.get("groups_failing_four_fifths"):
+                    st.warning(
+                        "Below the four-fifths screening ratio: "
+                        + ", ".join(
+                            f"`{g}`" for g in attribute["groups_failing_four_fifths"]
+                        ),
+                        icon="⚠️",
+                    )
+                if attribute.get("small_groups_present"):
+                    st.caption(
+                        "⚠️ Some groups are small, so their rates carry wide "
+                        "uncertainty and small differences may be noise."
+                    )
+                if attribute.get("undefined_metric_count"):
+                    st.caption(
+                        f"{attribute['undefined_metric_count']} metric(s) are "
+                        "undefined for this attribute and are reported as not "
+                        "available rather than as zero."
+                    )
+
+                rows = [
+                    g
+                    for g in fairness.get("groups") or []
+                    if g.get("attribute") == attribute.get("attribute")
+                ]
+                if rows:
+                    fig = go.Figure()
+                    names = [str(r.get("group")) for r in rows]
+                    for label, key, colour in (
+                        ("Selection rate", "selection_rate", C_SELECTION),
+                        ("TPR", "true_positive_rate", C_TPR),
+                        ("FPR", "false_positive_rate", C_FPR),
+                    ):
+                        values = [r.get(key) for r in rows]
+                        fig.add_bar(
+                            name=label,
+                            x=names,
+                            y=values,
+                            marker_color=colour,
+                            text=[_fmt(v, 3) for v in values],
+                            textposition="outside",
+                            hovertemplate="%{x} · " + label + ": %{y}<extra></extra>",
+                        )
+                    st.plotly_chart(
+                        _style(fig, height=380, y_title="Rate"), width="stretch"
+                    )
+                    st.caption(
+                        "A missing bar is an undefined metric (an empty denominator), "
+                        "not a zero."
+                    )
+                    st.dataframe(rows, width="stretch", hide_index=True)
+
+            render_caveats(fairness.get("interpretation"), "How to read this fairness "
+                           "assessment", icon="ℹ️")
+            st.error(f"**{fairness.get('four_fifths_notice', '')}**", icon="⚖️")
+
+    # --- explainability ----------------------------------------------------- #
+    with tabs[3]:
+        try:
+            explain = fetch_uploaded_explainability(base_url, run_id)
+        except ApiError as exc:
+            show_api_error(exc, "Explainability")
+        else:
+            status = str(explain.get("status"))
+            if status == "available":
+                st.success(f"#### 🔍 {status}\n{explain.get('status_detail','')}",
+                           icon="🔍")
+            else:
+                st.warning(f"#### ❔ {status}\n{explain.get('status_detail','')}",
+                           icon="❔")
+            st.caption(
+                f"Method: {explain.get('method') or 'n/a'} · repeats: "
+                f"{_fmt(explain.get('n_repeats'))} · scorer: "
+                f"{explain.get('scorer') or 'n/a'} · local method: "
+                f"{explain.get('local_method') or 'not available'}"
+            )
+
+            importance = explain.get("global_importance") or []
+            if importance:
+                ordered = list(reversed(importance))
+                fig = go.Figure(
+                    go.Bar(
+                        x=[i.get("importance_mean") for i in ordered],
+                        y=[i.get("feature") for i in ordered],
+                        orientation="h",
+                        marker_color=[
+                            C_THRESHOLD if i.get("is_selected_sensitive_column")
+                            else C_SELECTION
+                            for i in ordered
+                        ],
+                        error_x=dict(
+                            type="data",
+                            array=[i.get("importance_std") or 0 for i in ordered],
+                            color=INK_SECONDARY,
+                            thickness=1,
+                        ),
+                        text=[_fmt(i.get("importance_mean")) for i in ordered],
+                        textposition="outside",
+                        hovertemplate="%{y}: %{x}<extra></extra>",
+                    )
+                )
+                st.plotly_chart(
+                    _style(
+                        fig,
+                        height=max(320, 34 * len(ordered)),
+                        x_title="Permutation importance (mean drop in score)",
+                    ),
+                    width="stretch",
+                )
+                st.caption(
+                    "Red bars are columns you selected as sensitive. Importance is "
+                    "**association, not causation**: a high score means permuting the "
+                    "column degrades the score, not that the column causes the outcome."
+                )
+                st.dataframe(importance, width="stretch", hide_index=True)
+
+            for local in explain.get("local_explanations") or []:
+                with st.expander(
+                    f"Local explanation · {local.get('case_type')} "
+                    f"(row {local.get('row_index')})",
+                    expanded=False,
+                ):
+                    st.markdown(
+                        f"- Predicted: `{local.get('predicted_label')}` "
+                        f"(p={_fmt(local.get('predicted_probability'))})\n"
+                        f"- Actual: `{local.get('actual_label')}`\n"
+                        f"- Base value: {_fmt(local.get('base_value'))}"
+                    )
+                    st.dataframe(
+                        local.get("top_factors") or [], width="stretch", hide_index=True
+                    )
+
+            if explain.get("proxy_assessment"):
+                st.warning("**Possible proxy features**", icon="🔗")
+                for line in explain["proxy_assessment"]:
+                    st.markdown(f"- {line}")
+            render_caveats(explain.get("caveats"), "Explainability caveats")
+
+    # --- governance & risks ------------------------------------------------- #
+    with tabs[4]:
+        try:
+            governance = fetch_uploaded_governance(base_url, run_id)
+        except ApiError as exc:
+            show_api_error(exc, "Governance")
+        else:
+            render_governance_banner(governance)
+            counts = governance.get("severity_counts") or {}
+            if counts:
+                cols = st.columns(len(counts))
+                for col, (severity, count) in zip(cols, counts.items()):
+                    col.metric(severity.capitalize(), _fmt(count))
+            if governance.get("unavailable_capabilities"):
+                st.warning(
+                    "**Unavailable audit capabilities:** "
+                    + ", ".join(
+                        f"`{c}`" for c in governance["unavailable_capabilities"]
+                    )
+                    + ". These are reported as unavailable, not estimated.",
+                    icon="⚠️",
+                )
+            risks = governance.get("risks") or []
+            if risks:
+                st.markdown("**Risks identified**")
+                for risk in risks:
+                    with st.expander(
+                        f"{risk.get('severity','').upper()} · "
+                        f"`{risk.get('risk_id')}` — {risk.get('statement')}",
+                        expanded=False,
+                    ):
+                        st.markdown(
+                            f"- **Category:** {risk.get('category')}\n"
+                            f"- **Evidence:** {risk.get('evidence')}\n"
+                            f"- **Limitation:** {risk.get('limitation')}\n"
+                            f"- **Recommended action:** "
+                            f"{risk.get('recommended_action')}"
+                        )
+            st.info(governance.get("reference_case_note", ""), icon="📄")
+            render_caveats(governance.get("limitations"), "Limitations")
+
+    # --- integrity ---------------------------------------------------------- #
+    with tabs[5]:
+        st.caption(
+            "Recomputes the SHA-256 of every baselined artefact now and compares it "
+            "with the checksum recorded when the run was created."
+        )
+        try:
+            integrity = fetch_uploaded_integrity(base_url, run_id)
+        except ApiError as exc:
+            show_api_error(exc, "Integrity")
+        else:
+            status = str(integrity.get("integrity_status"))
+            icon, kind = INTEGRITY_STYLE.get(status, ("❔", "warning"))
+            getattr(st, kind)(
+                f"**{icon} Integrity: {status.replace('_', ' ').upper()}** — "
+                f"{integrity.get('verified_count')} verified, "
+                f"{integrity.get('changed_count')} changed, "
+                f"{integrity.get('missing_count')} missing of "
+                f"{integrity.get('artifacts_checked')} artefacts. "
+                f"Checked {integrity.get('checked_at')}.",
+                icon=icon,
+            )
+            cols = st.columns(4)
+            cols[0].metric("Checked", _fmt(integrity.get("artifacts_checked")))
+            cols[1].metric("✅ Verified", _fmt(integrity.get("verified_count")))
+            cols[2].metric("🔴 Changed", _fmt(integrity.get("changed_count")))
+            cols[3].metric("⚠️ Missing", _fmt(integrity.get("missing_count")))
+            st.dataframe(
+                integrity.get("artifacts") or [], width="stretch", hide_index=True
+            )
+            st.caption(f"Method: {integrity.get('method')}")
+            render_caveats(
+                integrity.get("interpretation"),
+                "What this integrity result does and does not establish",
+                icon="ℹ️",
+            )
+
+    # --- timeline ----------------------------------------------------------- #
+    with tabs[6]:
+        try:
+            timeline = fetch_uploaded_timeline(base_url, run_id)
+        except ApiError as exc:
+            show_api_error(exc, "Timeline")
+        else:
+            st.caption(
+                f"{timeline.get('count')} event(s), oldest first. "
+                f"{timeline.get('note', '')}"
+            )
+            markers = {"run": "📄", "registry": "📒", "waiver": "🟡"}
+            for event in timeline.get("events") or []:
+                marker = markers.get(str(event.get("source")), "•")
+                st.markdown(
+                    f"{marker} **{event.get('event_time')}** · "
+                    f"`{event.get('event_type')}` — {event.get('detail')}"
+                )
+
+
+# --------------------------------------------------------------------------- #
+# Page 10 — Policy Gates & Conformity Bundle
+# --------------------------------------------------------------------------- #
+def page_policy_gates(base_url: str) -> None:
+    st.title("Policy gates & Conformity Bundle")
+    st.caption(
+        "Governance-as-Code: a versioned policy file evaluated deterministically "
+        "over one run's evidence, producing PASS / WAIVE / BLOCK / NOT_EVALUATED per "
+        "gate."
+    )
+    render_intake_notice()
+
+    policy_tab, run_tab = st.tabs(["Policy profile", "Run evaluation"])
+
+    # --- policy profile ----------------------------------------------------- #
+    with policy_tab:
+        try:
+            policies = fetch_policies(base_url)
+        except ApiError as exc:
+            show_api_error(exc, "Policies")
+        else:
+            profiles = policies.get("policies") or []
+            if not profiles:
+                st.warning("The API served no policy profiles.", icon="📭")
+            for policy in profiles:
+                st.subheader(
+                    f"{policy.get('policy_name')} v{policy.get('policy_version')}"
+                )
+                cols = st.columns(4)
+                cols[0].metric("Policy id", str(policy.get("policy_id")))
+                cols[1].metric("Status", str(policy.get("policy_status")))
+                cols[2].metric("Gates", _fmt(len(policy.get("gates") or [])))
+                cols[3].metric("Controls", _fmt(len(policy.get("controls") or [])))
+                st.caption(
+                    f"Source `{policy.get('source_file')}` · SHA-256 "
+                    f"`{policy.get('checksum')}` · effective from "
+                    f"{policy.get('effective_from')}"
+                )
+                st.markdown(f"**Purpose.** {policy.get('purpose')}")
+
+                st.markdown("**Gate sequence**")
+                for gate in sorted(
+                    policy.get("gates") or [], key=lambda g: g.get("order", 0)
+                ):
+                    never = (
+                        " · **never auto-passed**" if gate.get("never_auto_pass") else ""
+                    )
+                    st.markdown(
+                        f"{gate.get('order')}. **{gate.get('gate_code')} — "
+                        f"{gate.get('gate_name')}** (owner: {gate.get('owner')})"
+                        f"{never}  \n"
+                        f"_{gate.get('question')}_  \n"
+                        "Controls: "
+                        + ", ".join(f"`{c}`" for c in gate.get("controls") or [])
+                    )
+
+                with st.expander("Controls", expanded=False):
+                    st.dataframe(
+                        policy.get("controls") or [], width="stretch", hide_index=True
+                    )
+                with st.expander("Thresholds", expanded=False):
+                    st.dataframe(
+                        policy.get("thresholds") or [], width="stretch", hide_index=True
+                    )
+                with st.expander("Decision semantics", expanded=True):
+                    for name, meaning in (policy.get("statuses") or {}).items():
+                        st.markdown(f"- **{name}** — {meaning}")
+                    st.markdown(f"**Gate result rule.** {policy.get('gate_result_rule')}")
+                    for name, meaning in (policy.get("decision_semantics") or {}).items():
+                        st.markdown(f"- **{name}** — {meaning}")
+                with st.expander("Never auto-passed", expanded=True):
+                    st.json(policy.get("never_auto_pass") or {}, expanded=True)
+                with st.expander("Waiver rules", expanded=False):
+                    st.json(policy.get("waiver_rules") or {}, expanded=False)
+                with st.expander("Coverage metrics", expanded=False):
+                    st.json(policy.get("coverage_metrics") or {}, expanded=False)
+                render_caveats(policy.get("limitations"), "Policy limitations")
+            st.caption(policies.get("notice", ""))
+
+    # --- run evaluation ----------------------------------------------------- #
+    with run_tab:
+        run_id = uploaded_run_selector(base_url, key="gates_run_pick")
+        if run_id is None:
+            return
+
+        try:
+            evaluation = fetch_gate_evaluation(base_url, run_id)
+        except ApiError as exc:
+            show_api_error(exc, "Gate evaluation")
+            return
+
+        st.subheader("Gate decisions")
+        render_gate_row(evaluation.get("gate_summary") or {})
+        st.caption(
+            f"Policy `{evaluation.get('policy_profile_id')}` "
+            f"v{evaluation.get('policy_version')} · evaluated "
+            f"{evaluation.get('evaluated_at')} · deterministic: "
+            f"{_fmt(evaluation.get('deterministic'))}"
+        )
+
+        for gate in sorted(
+            evaluation.get("gates") or [], key=lambda g: g.get("order", 0)
+        ):
+            icon, kind = GATE_STYLE.get(str(gate.get("status")), ("❔", "info"))
+            with st.expander(
+                f"{icon} {gate.get('gate_code')} — {gate.get('gate_name')}: "
+                f"{gate.get('status')}",
+                expanded=str(gate.get("status")) == "BLOCK",
+            ):
+                st.markdown(f"_{gate.get('question')}_")
+                st.markdown(
+                    f"**Result.** {gate.get('reason')}  \n"
+                    f"**Owner.** {gate.get('owner')}  \n"
+                    "**Controls.** "
+                    + ", ".join(f"`{c}`" for c in gate.get("control_ids") or [])
+                )
+                if gate.get("never_auto_pass"):
+                    st.info(
+                        "This gate is never automatically passed. It requires a human "
+                        "decision recorded outside this prototype.",
+                        icon="🖐️",
+                    )
+
+        if evaluation.get("blocking_controls"):
+            st.error(
+                "**Blocking controls:** "
+                + ", ".join(f"`{c}`" for c in evaluation["blocking_controls"]),
+                icon="⛔",
+            )
+        if evaluation.get("waivers_applied"):
+            st.warning(
+                "**Waivers applied in this evaluation:** "
+                + ", ".join(f"`{w}`" for w in evaluation["waivers_applied"])
+                + ". A WAIVE below is an accepted risk, not a satisfied control.",
+                icon="🟡",
+            )
+        if evaluation.get("fairness_gate_notice"):
+            st.warning(f"**{evaluation['fairness_gate_notice']}**", icon="⚖️")
+        st.info(evaluation.get("release_gate_note", ""), icon="🖐️")
+
+        cols = st.columns(2)
+        cols[0].metric(
+            "Evidence coverage", _fmt(evaluation.get("evidence_coverage_score"), 3)
+        )
+        cols[1].metric(
+            "Control coverage", _fmt(evaluation.get("control_coverage_score"), 3)
+        )
+        st.caption(evaluation.get("coverage_metric_caveat", ""))
+
+        with st.expander("Control findings", expanded=False):
+            st.dataframe(
+                evaluation.get("controls") or [], width="stretch", hide_index=True
+            )
+        render_caveats(evaluation.get("limitations"), "Evaluation limitations")
+
+        # --- re-evaluation -------------------------------------------------- #
+        st.divider()
+        st.subheader("Re-evaluate")
+        st.caption(
+            "Re-runs the policy over this run's stored evidence. No measurement is "
+            "recomputed and the model is not re-run. Identical evidence and policy "
+            "must produce `changed: false` — that is the determinism check."
+        )
+        if st.button("♻️ Re-evaluate policy", key="gates_reevaluate"):
+            try:
+                outcome = GovernanceApiClient(base_url).evaluate_gates(run_id)
+            except ApiError as exc:
+                show_api_error(exc, "Re-evaluation")
+            else:
+                st.cache_data.clear()
+                if outcome.get("changed"):
+                    st.warning(
+                        f"**The result changed.** New bundle "
+                        f"`{outcome.get('conformity_bundle_id')}`, gates "
+                        f"{outcome.get('gate_summary')}.",
+                        icon="🔄",
+                    )
+                else:
+                    st.success(
+                        f"**Unchanged.** Same verdict and same bundle id "
+                        f"`{outcome.get('conformity_bundle_id')}`.",
+                        icon="✅",
+                    )
+                st.caption(
+                    "Rewritten: "
+                    + ", ".join(f"`{a}`" for a in outcome.get("artifacts_rewritten") or [])
+                )
+
+        # --- conformity bundle ---------------------------------------------- #
+        st.divider()
+        st.subheader("Conformity Bundle")
+        try:
+            bundle = fetch_conformity_bundle(base_url, run_id)
+        except ApiError as exc:
+            show_api_error(exc, "Conformity Bundle")
+        else:
+            cols = st.columns(3)
+            cols[0].metric("Bundle id", str(bundle.get("bundle_id")))
+            cols[1].metric("Bundle version", str(bundle.get("bundle_version")))
+            cols[2].metric(
+                "Digital signature",
+                "none implemented" if bundle.get("signature") is None else "present",
+            )
+            st.markdown(
+                f"- Model: `{bundle.get('model_name')}` v`{bundle.get('model_version')}`"
+                f" · owner {bundle.get('model_owner')}\n"
+                f"- Model SHA-256: `{bundle.get('model_checksum')}`\n"
+                f"- Dataset: `{bundle.get('dataset_identifier')}` "
+                f"({_fmt(bundle.get('dataset_row_count'))} rows)\n"
+                f"- Dataset SHA-256: `{bundle.get('dataset_checksum')}`\n"
+                f"- Policy: `{bundle.get('policy_profile_id')}` "
+                f"v{bundle.get('policy_version')} "
+                f"(SHA-256 `{bundle.get('policy_checksum')}`)\n"
+                f"- Evidence digest: `{bundle.get('evidence_digest')}`\n"
+                f"- Gate sequence: "
+                + " → ".join(bundle.get("gate_sequence") or [])
+            )
+            st.caption(
+                "The bundle id is content-addressed: it is derived from the evidence "
+                "digest, the policy identity and the gate decisions — never from a "
+                "timestamp — so re-evaluating unchanged evidence reproduces the same "
+                "id, and any change to the evidence or the verdict produces a "
+                "different one."
+            )
+            st.markdown("**Evidence**")
+            st.dataframe(bundle.get("evidence") or [], width="stretch", hide_index=True)
+            cols = st.columns(2)
+            cols[0].metric(
+                "Evidence coverage", _fmt(bundle.get("evidence_coverage_score"), 3)
+            )
+            cols[1].metric(
+                "Control coverage", _fmt(bundle.get("control_coverage_score"), 3)
+            )
+            st.caption(bundle.get("coverage_metric_caveat", ""))
+            st.download_button(
+                "⬇️ Download conformity_bundle.json",
+                data=json.dumps(bundle, indent=2, sort_keys=True),
+                file_name=f"{run_id}_conformity_bundle.json",
+                mime="application/json",
+                help="Exactly what the API served. Every checksum in it can be "
+                "verified independently against the files under runtime/.",
+            )
+            render_caveats(bundle.get("limitations"), "Bundle limitations")
+            render_caveats(
+                bundle.get("disclaimers"), "What this bundle is not", icon="⛔"
+            )
+
+        # --- traceability --------------------------------------------------- #
+        st.divider()
+        st.subheader("Traceability matrix")
+        st.caption(
+            "One row per control: the policy requirement, the artefact evidencing it, "
+            "the endpoint that serves it, and the expected against actual checksum."
+        )
+        try:
+            matrix = fetch_traceability(base_url, run_id)
+        except ApiError as exc:
+            show_api_error(exc, "Traceability")
+        else:
+            st.dataframe(matrix.get("rows") or [], width="stretch", hide_index=True)
+            if matrix.get("unresolved_evidence"):
+                st.error(
+                    "**Unresolved evidence** (missing or changed since creation):\n"
+                    + "\n".join(f"- {u}" for u in matrix["unresolved_evidence"]),
+                    icon="🔴",
+                )
+            else:
+                st.success(
+                    "Every control's evidence path resolves and every checksum "
+                    "matches the value recorded at audit time.",
+                    icon="✅",
+                )
+
+        # --- waivers -------------------------------------------------------- #
+        st.divider()
+        st.subheader("Waivers")
+        st.warning(
+            "A waiver is an **explicit, time-bounded human decision** to accept a "
+            "risk. The platform never creates or approves one, nothing here is "
+            "defaulted for you, and **a waiver can never satisfy or override the "
+            "Release Gate**. Status is recomputed against the clock on every read, so "
+            "an expired waiver simply stops applying.",
+            icon="🟡",
+        )
+        try:
+            waivers = fetch_waivers(base_url, run_id)
+        except ApiError as exc:
+            show_api_error(exc, "Waivers")
+            waivers = []
+
+        if waivers:
+            st.dataframe(waivers, width="stretch", hide_index=True)
+            active = [w for w in waivers if w.get("status") == "active"]
+            if active:
+                labels = [
+                    f"{w.get('waiver_id')} · {w.get('control_id')} · expires "
+                    f"{w.get('expires_at')}"
+                    for w in active
+                ]
+                target = st.selectbox("Active waiver to revoke", labels, key="revoke_pick")
+                if st.button("🚫 Revoke selected waiver", key="revoke_go"):
+                    waiver_id = str(active[labels.index(target)].get("waiver_id"))
+                    try:
+                        outcome = GovernanceApiClient(base_url).revoke_waiver(
+                            run_id, waiver_id
+                        )
+                    except ApiError as exc:
+                        show_api_error(exc, "Revocation")
+                    else:
+                        st.cache_data.clear()
+                        st.success(
+                            f"`{outcome.get('waiver_id')}` is now "
+                            f"**{outcome.get('status')}**. The row is retained rather "
+                            "than deleted — a waiver that once applied is part of this "
+                            "run's history. Re-evaluate to apply the change.",
+                            icon="✅",
+                        )
+        else:
+            st.caption(
+                "No waiver has been recorded for this run. None is created "
+                "automatically, and none exists for the built-in Adult Income "
+                "reference case."
+            )
+
+        controls = [
+            c.get("control_id")
+            for c in evaluation.get("controls") or []
+            if c.get("waiver_eligible")
+        ]
+        with st.expander("Record a waiver", expanded=False):
+            if not controls:
+                st.caption("No control in this evaluation is waiver-eligible.")
+            else:
+                with st.form("waiver_form"):
+                    control_id = st.selectbox("Control", controls)
+                    scope = st.text_input(
+                        "Scope",
+                        help="Exactly what is being accepted, and for what use.",
+                    )
+                    owner = st.text_input(
+                        "Accountable owner",
+                        help="The person accepting this risk by name or role.",
+                    )
+                    expires_at = st.text_input(
+                        "Expires at (ISO-8601)",
+                        placeholder="2027-01-01T00:00:00+00:00",
+                        help="Must be in the future. A waiver with no expiry is not "
+                        "accepted.",
+                    )
+                    rationale = st.text_area("Rationale")
+                    compensating = st.text_area(
+                        "Compensating controls (one per line)",
+                        help="At least one is required.",
+                    )
+                    record = st.form_submit_button("🟡 Record waiver")
+                if record:
+                    payload = {
+                        "control_id": control_id,
+                        "scope": scope.strip(),
+                        "owner": owner.strip(),
+                        "expires_at": expires_at.strip(),
+                        "rationale": rationale.strip(),
+                        "compensating_controls": [
+                            line.strip()
+                            for line in compensating.splitlines()
+                            if line.strip()
+                        ],
+                    }
+                    try:
+                        created = GovernanceApiClient(base_url).create_waiver(
+                            run_id, payload
+                        )
+                    except ApiError as exc:
+                        show_api_error(exc, "Waiver")
+                    else:
+                        st.cache_data.clear()
+                        st.success(
+                            f"Recorded `{created.get('waiver_id')}` against "
+                            f"`{created.get('control_id')}`, status "
+                            f"**{created.get('status')}**, expiring "
+                            f"{created.get('expires_at')}. "
+                            "Re-evaluate the policy to apply it.",
+                            icon="🟡",
+                        )
+                        st.caption(created.get("notice", ""))
+
+
+# --------------------------------------------------------------------------- #
 # Router
 # --------------------------------------------------------------------------- #
 def main() -> None:
@@ -1576,6 +3091,9 @@ def main() -> None:
         "Governance Decision & Risks": page_governance,
         "Agent Review": page_agent_review,
         "Model Registry": page_model_registry,
+        "New Model Audit": page_new_audit,
+        "Uploaded Audit Runs": page_uploaded_audits,
+        "Policy Gates & Conformity Bundle": page_policy_gates,
     }
     try:
         renderers[page](base_url)

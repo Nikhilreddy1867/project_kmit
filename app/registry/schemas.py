@@ -18,9 +18,17 @@ from pydantic import BaseModel, ConfigDict, Field
 _CFG = ConfigDict(protected_namespaces=())
 
 RunStatus = Literal["active", "superseded", "archived"]
+RunType = Literal["reference_case", "uploaded_model"]
 IntegrityStatus = Literal[
     "verified", "incomplete", "modified", "modified_and_incomplete"
 ]
+
+RUN_TYPE_NOTE = (
+    "'reference_case' is the built-in Adult Income audit. 'uploaded_model' is a run "
+    "produced from a user submission and stored under runtime/. The two are separate "
+    "records: neither supersedes the other, and no uploaded run affects the reference "
+    "case's decision."
+)
 
 REGISTRY_DISCLAIMER = (
     "The registry records what evidence existed and what its checksums were. It "
@@ -33,7 +41,15 @@ REGISTRY_DISCLAIMER = (
 # Coverage / decision blocks
 # --------------------------------------------------------------------------- #
 class AuditCoverage(BaseModel):
-    """Which audit phases are evidenced by this run."""
+    """
+    Which audit phases are evidenced by this run.
+
+    This is the reference case's coverage shape. An uploaded-model run reports a
+    different set of capability flags (``roc_auc``, ``explainability_global``,
+    ``explainability_local_shap``), so the fields that carry it are typed as a union
+    with a plain mapping. Coercing one shape into the other would mean reporting
+    coverage the run does not have.
+    """
 
     model_config = _CFG
 
@@ -73,6 +89,11 @@ class PerformanceSummary(BaseModel):
     model_name: str
     n_test: int | None = None
     decision_threshold: float | None = None
+    threshold_applied: bool | None = Field(
+        default=None,
+        description="False when the model exposes no predict_proba, so the threshold "
+        "was not applied and the model's own decision rule produced the labels.",
+    )
     positive_class: str | None = None
     accuracy: float | None = None
     precision: float | None = None
@@ -83,6 +104,10 @@ class PerformanceSummary(BaseModel):
     false_positives: int | None = None
     false_negatives: int | None = None
     true_positives: int | None = None
+    roc_auc_unavailable_reason: str | None = Field(
+        default=None,
+        description="Why ROC-AUC is null. Present rather than a fabricated value.",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -104,6 +129,7 @@ class AuditRunSummary(BaseModel):
     model_config = _CFG
 
     run_id: str
+    run_type: RunType = Field(default="reference_case", description=RUN_TYPE_NOTE)
     status: RunStatus
     created_at: str
     refreshed_at: str
@@ -125,6 +151,7 @@ class AuditRunDetail(BaseModel):
     model_config = _CFG
 
     run_id: str
+    run_type: RunType = Field(default="reference_case", description=RUN_TYPE_NOTE)
     schema_version: int
     status: RunStatus
     created_at: str
@@ -138,10 +165,16 @@ class AuditRunDetail(BaseModel):
     model_run_identifier: str
     evidence_digest: str
     artifact_count: int
-    performance_summary: PerformanceSummary
+    performance_summary: PerformanceSummary | dict[str, Any] = Field(
+        description="The reference shape for a reference-case run. An uploaded run "
+        "whose performance artefact is absent reports why instead."
+    )
     governance_decision: RecordedDecision
     blocking_risk_ids: list[str]
-    audit_coverage: AuditCoverage
+    audit_coverage: AuditCoverage | dict[str, Any] = Field(
+        description="Reference-case runs use the five-phase shape; uploaded runs "
+        "report their own capability flags."
+    )
     artifacts: list[RegisteredArtifact]
     disclaimer: str = REGISTRY_DISCLAIMER
 
@@ -151,10 +184,21 @@ class RunListResponse(BaseModel):
 
     count: int
     active_run_id: str | None = Field(
-        default=None, description="The single run currently marked active, if any."
+        default=None,
+        description="The active reference-case run. Scoped by run type on purpose: "
+        "registering uploaded audits never moves it.",
+    )
+    active_reference_run_id: str | None = Field(
+        default=None, description="Explicit alias for active_run_id."
+    )
+    uploaded_run_ids: list[str] = Field(
+        default_factory=list,
+        description="Uploaded-model runs, newest first. Listed separately so they are "
+        "never mistaken for versions of the reference case.",
     )
     database: str = Field(description="Registry database path, repo-relative.")
     filters_applied: dict[str, str | None] = Field(default_factory=dict)
+    run_type_note: str = RUN_TYPE_NOTE
     runs: list[AuditRunSummary]
     disclaimer: str = REGISTRY_DISCLAIMER
 
@@ -246,6 +290,7 @@ class RegistrationResult(BaseModel):
     model_config = _CFG
 
     run_id: str
+    run_type: RunType = "reference_case"
     action: Literal["created", "refreshed", "superseded_previous"]
     created_at: str
     refreshed_at: str
@@ -266,5 +311,10 @@ class RegistryStatsResponse(BaseModel):
     active: int
     superseded: int
     archived: int
+    by_run_type: dict[str, int] = Field(
+        default_factory=dict,
+        description="Run counts split by run type, so the reference case and uploaded "
+        "audits are countable separately.",
+    )
     database: str
     initialised: bool

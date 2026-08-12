@@ -179,7 +179,10 @@ def test_entry_point_boots_api_and_renders_dashboard() -> None:
 
     assert not at.exception, f"entry point raised: {at.exception}"
     assert _port_open(8000), "the entry point must have started the API"
-    assert at.sidebar.radio[0].options == [
+    # The exact list, in order: the seven reference-case pages first and unchanged,
+    # then the three model-intake pages. Asserted exactly rather than by membership
+    # so that a page quietly disappearing fails here.
+    reference_pages = [
         "Overview",
         "Model Performance",
         "Fairness Audit",
@@ -187,6 +190,13 @@ def test_entry_point_boots_api_and_renders_dashboard() -> None:
         "Governance Decision & Risks",
         "Agent Review",
         "Model Registry",
+    ]
+    options = at.sidebar.radio[0].options
+    assert options[: len(reference_pages)] == reference_pages
+    assert options[len(reference_pages) :] == [
+        "New Model Audit",
+        "Uploaded Audit Runs",
+        "Policy Gates & Conformity Bundle",
     ]
 
     # The dashboard is genuinely reading through the embedded API, not showing an

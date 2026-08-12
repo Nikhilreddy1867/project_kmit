@@ -1,0 +1,273 @@
+{
+  "policy_id": "research_governance_policy_v1",
+  "policy_name": "Research Governance Policy v1",
+  "policy_version": "1.0.0",
+  "policy_status": "active",
+  "effective_from": "2026-01-01",
+  "authored_by": "MAAT platform (academic prototype)",
+  "applies_to": {
+    "run_types": ["uploaded_model"],
+    "task_types": ["binary_classification"],
+    "excludes": [
+      "The built-in Adult Income reference case is NOT evaluated by this policy. Its governance decision was reached separately and remains unchanged."
+    ]
+  },
+  "purpose": "A versioned, machine-readable research governance policy so that gate decisions are reproducible from the policy file plus the run evidence, rather than from code that happens to be running. Changing a threshold means editing this file and bumping the version -- not editing the engine.",
+  "gate_sequence": [
+    {
+      "gate_code": "DG",
+      "gate_name": "Data Gate",
+      "order": 1,
+      "owner": "Data steward",
+      "question": "Is the dataset identified, described and integrity-checked?"
+    },
+    {
+      "gate_code": "TG",
+      "gate_name": "Training Gate",
+      "order": 2,
+      "owner": "Model developer",
+      "question": "Is the model identified by checksum and structurally compatible with the dataset?"
+    },
+    {
+      "gate_code": "VG",
+      "gate_name": "Validation Gate",
+      "order": 3,
+      "owner": "Independent validator",
+      "question": "Does measured performance, fairness screening and explainability evidence meet the configured research thresholds?"
+    },
+    {
+      "gate_code": "RG",
+      "gate_name": "Release Gate",
+      "order": 4,
+      "owner": "Accountable release authority (human)",
+      "question": "Has a named human authorised release, with deployment risk visible?"
+    },
+    {
+      "gate_code": "OG",
+      "gate_name": "Operations Gate",
+      "order": 5,
+      "owner": "Operations owner",
+      "question": "Is monitoring, rollback and incident response in place for live use?"
+    }
+  ],
+  "thresholds": {
+    "roc_auc_min": {
+      "value": 0.85,
+      "applies_when": "The model exposes predict_proba, so a probability-based ranking metric exists.",
+      "on_absent_evidence": "NOT_EVALUATED",
+      "rationale": "A configured research-policy floor for discrimination ability. It is not a regulatory or industry standard."
+    },
+    "f1_min": {
+      "value": 0.65,
+      "applies_when": "always",
+      "on_absent_evidence": "NOT_EVALUATED",
+      "rationale": "A configured research-policy floor balancing precision and recall at the audited threshold."
+    },
+    "disparate_impact_ratio_min": {
+      "value": 0.8,
+      "applies_when": "The user supplied at least one sensitive column, so group rates could be computed.",
+      "on_absent_evidence": "NOT_EVALUATED",
+      "rationale": "The four-fifths screening heuristic. A screening device only: it is not a legal conclusion and does not prove discrimination or causation."
+    },
+    "explainability_required": {
+      "value": true,
+      "applies_when": "The model type is one this prototype can explain (any estimator exposing predict(X)).",
+      "on_absent_evidence": "NOT_EVALUATED",
+      "rationale": "Where explainability evidence can be produced, this policy requires that it was produced."
+    },
+    "small_group_threshold": {
+      "value": 200,
+      "applies_when": "always",
+      "rationale": "Groups smaller than this carry sampling uncertainty wide enough that a screening failure is reported with an explicit uncertainty caveat rather than as a firm result."
+    }
+  },
+  "statuses": {
+    "PASS": "The control's evidence was present and met the configured policy requirement.",
+    "WAIVE": "The control was not met, and an explicit, time-bounded, human-created waiver is currently in force for it. A waiver records an accepted risk; it does not make the requirement met.",
+    "BLOCK": "The control's evidence was present and did NOT meet the configured policy requirement.",
+    "NOT_EVALUATED": "The control was not assessed, because the evidence it needs does not exist in this prototype or was not supplied. This is neither a pass nor a failure."
+  },
+  "gate_result_rule": "A gate is BLOCK if any of its controls is BLOCK. Otherwise it is PASS if at least one control is PASS or WAIVE and none is NOT_EVALUATED. Otherwise it is NOT_EVALUATED. The Release and Operations gates are excluded from the PASS branch entirely -- see never_auto_pass.",
+  "never_auto_pass": {
+    "gates": ["RG", "OG"],
+    "reason": "Release and operational readiness are human accountability decisions supported by evidence this prototype does not hold (a named authorisation record, monitoring, rollback, incident response). No computation in this platform can produce them, so these gates can only be BLOCK or NOT_EVALUATED. This platform never states that a user-uploaded model is production-ready."
+  },
+  "decision_semantics": {
+    "authority": "Advisory. Gate results are deterministic decision-support evidence for a human reviewer.",
+    "not_a_legal_conclusion": "No gate result is a statement of legal compliance or non-compliance, a finding of discrimination, or a causal claim.",
+    "not_a_deployment_approval": "No combination of gate results authorises deployment of an uploaded model.",
+    "determinism": "Identical evidence plus identical policy version yields an identical evaluation. Nothing here samples, learns or varies between runs.",
+    "fairness_gate_wording": "This is a configured research-policy gate result, not a legal conclusion or proof of discrimination."
+  },
+  "waiver_rules": {
+    "creation": "Explicit and human-initiated only. The platform never creates a waiver automatically.",
+    "approval": "Human only. The platform never approves a waiver automatically.",
+    "time_bounded": "Every waiver must carry an expiry timestamp. An expired waiver has no effect and the control reverts to BLOCK.",
+    "scope": "A waiver applies to exactly one control on exactly one audit run.",
+    "release_gate": "A waiver can never satisfy or override the Release Gate. RG-01 is not waiver-eligible.",
+    "reference_case": "No waiver may be created for the built-in Adult Income reference case; it is not governed by this policy.",
+    "storage": "Waiver events live only in the runtime SQLite state under runtime/. They are never written into the immutable evidence tree.",
+    "required_fields": [
+      "waiver_id",
+      "control_id",
+      "audit_run_id",
+      "scope",
+      "owner",
+      "expires_at",
+      "rationale",
+      "compensating_controls",
+      "status"
+    ]
+  },
+  "controls": [
+    {
+      "control_id": "DG-01",
+      "gate": "DG",
+      "title": "Dataset provenance",
+      "requirement": "The dataset must be identified by SHA-256 checksum with row/column counts, the target column, and the declared decision context recorded.",
+      "evidence_artifact": "uploaded_dataset_metadata.json",
+      "evidence_required": true,
+      "api_endpoint": "/api/onboarding/audits/{audit_run_id}",
+      "owner": "Data steward",
+      "waiver_eligible": false,
+      "limitation": "Provenance is as declared by the uploader. This platform verifies that the declaration exists and that the file has not changed since upload -- it cannot verify that the declaration is true, nor that the data was lawfully collected."
+    },
+    {
+      "control_id": "DG-02",
+      "gate": "DG",
+      "title": "Dataset evidence integrity",
+      "requirement": "The stored dataset file must still hash to the checksum recorded at upload time.",
+      "evidence_artifact": "uploaded_dataset_metadata.json",
+      "evidence_required": true,
+      "api_endpoint": "/api/onboarding/audits/{audit_run_id}/integrity",
+      "owner": "Data steward",
+      "waiver_eligible": false,
+      "limitation": "Detects change after upload. It does not authenticate the uploader and is not a digital signature -- no signing keys exist in this prototype. The cited artefact is the record holding the upload-time checksum; the stored dataset file it describes is reported under the finding's observed values. evidence_manifest.json is the sealed baseline for the run as a whole, but no document can record its own checksum, so it is not cited as a control's own evidence."
+    },
+    {
+      "control_id": "TG-01",
+      "gate": "TG",
+      "title": "Model identity and checksum",
+      "requirement": "The model must be identified by SHA-256 checksum, with its declared name, version and accountable owner recorded, and the security acknowledgement captured before loading.",
+      "evidence_artifact": "uploaded_model_metadata.json",
+      "evidence_required": true,
+      "api_endpoint": "/api/onboarding/audits/{audit_run_id}",
+      "owner": "Model developer",
+      "waiver_eligible": false,
+      "limitation": "Identifies the artefact that was audited. It says nothing about how the model was trained, on what data, or whether that training was appropriate -- none of which is visible from a serialised estimator."
+    },
+    {
+      "control_id": "TG-02",
+      "gate": "TG",
+      "title": "Feature compatibility",
+      "requirement": "Every input feature the model expects must be present in the dataset, established by feature_names_in_ where the estimator records it.",
+      "evidence_artifact": "uploaded_model_metadata.json",
+      "evidence_required": true,
+      "api_endpoint": "/api/onboarding/audits/{audit_run_id}",
+      "owner": "Model developer",
+      "waiver_eligible": false,
+      "limitation": "Structural compatibility only. Matching column names do not establish that the columns mean the same thing as at training time, which is the failure mode this check cannot see."
+    },
+    {
+      "control_id": "VG-01",
+      "gate": "VG",
+      "title": "Performance threshold",
+      "requirement": "ROC-AUC >= 0.85 where probability output is available, and F1 >= 0.65.",
+      "evidence_artifact": "performance.json",
+      "evidence_required": true,
+      "api_endpoint": "/api/onboarding/audits/{audit_run_id}/performance",
+      "owner": "Independent validator",
+      "waiver_eligible": true,
+      "limitation": "Measured on the single uploaded dataset at the configured threshold. It does not establish that performance transfers to the population the model would be used on."
+    },
+    {
+      "control_id": "VG-02",
+      "gate": "VG",
+      "title": "Fairness screening",
+      "requirement": "Minimum disparate impact ratio >= 0.80 across every group of every user-selected sensitive attribute, measured against the largest group.",
+      "evidence_artifact": "fairness.json",
+      "evidence_required": false,
+      "api_endpoint": "/api/onboarding/audits/{audit_run_id}/fairness",
+      "owner": "Independent validator",
+      "waiver_eligible": true,
+      "limitation": "The four-fifths threshold is a screening heuristic. It is not a legal conclusion and does not prove discrimination or causation. Where no sensitive columns were selected this control is NOT_EVALUATED, which is an absence of evidence rather than a pass."
+    },
+    {
+      "control_id": "VG-03",
+      "gate": "VG",
+      "title": "Explainability evidence",
+      "requirement": "Global feature-importance evidence must exist for model types this prototype supports.",
+      "evidence_artifact": "explainability.json",
+      "evidence_required": false,
+      "api_endpoint": "/api/onboarding/audits/{audit_run_id}/explainability",
+      "owner": "Independent validator",
+      "waiver_eligible": true,
+      "limitation": "Permutation importance is associational, not causal, and correlated features share importance. Where the model type is unsupported this control is NOT_EVALUATED -- the limitation is the prototype's, not necessarily the model's."
+    },
+    {
+      "control_id": "RG-01",
+      "gate": "RG",
+      "title": "Human release authorization",
+      "requirement": "A named accountable human must record an explicit release authorisation, with date and scope of intended use.",
+      "evidence_artifact": null,
+      "evidence_required": true,
+      "api_endpoint": null,
+      "owner": "Accountable release authority (human)",
+      "waiver_eligible": false,
+      "limitation": "This prototype holds no authorisation record and provides no way to create one, so this control is always NOT_EVALUATED. It can never be satisfied by computation, and it is explicitly not waiver-eligible."
+    },
+    {
+      "control_id": "RG-02",
+      "gate": "RG",
+      "title": "Deployment-risk visibility",
+      "requirement": "A deterministic risk summary must be available to the release authority before any release decision.",
+      "evidence_artifact": "risk_summary.json",
+      "evidence_required": true,
+      "api_endpoint": "/api/onboarding/audits/{audit_run_id}/governance",
+      "owner": "Accountable release authority (human)",
+      "waiver_eligible": false,
+      "limitation": "Producing a risk summary makes risk visible; it does not reduce or accept risk, and it does not constitute a release decision. The Release Gate therefore cannot pass on the strength of this control alone."
+    },
+    {
+      "control_id": "OG-01",
+      "gate": "OG",
+      "title": "Monitoring readiness",
+      "requirement": "Production monitoring for performance decay, input drift and group-level outcome drift must be defined and in place.",
+      "evidence_artifact": null,
+      "evidence_required": true,
+      "api_endpoint": null,
+      "owner": "Operations owner",
+      "waiver_eligible": false,
+      "limitation": "Out of scope for this prototype, which accepts a model file and a dataset only. Always NOT_EVALUATED -- not assessed, so neither passed nor failed."
+    },
+    {
+      "control_id": "OG-02",
+      "gate": "OG",
+      "title": "Rollback and incident readiness",
+      "requirement": "A tested rollback path and a documented incident-response route for affected individuals must exist.",
+      "evidence_artifact": null,
+      "evidence_required": true,
+      "api_endpoint": null,
+      "owner": "Operations owner",
+      "waiver_eligible": false,
+      "limitation": "Out of scope for this prototype. Always NOT_EVALUATED."
+    }
+  ],
+  "coverage_metrics": {
+    "evidence_coverage_score": {
+      "definition": "verified required evidence artefacts / total required evidence artefacts",
+      "naming": "A governance coverage metric. It is NOT a certified regulatory compliance score."
+    },
+    "control_coverage_score": {
+      "definition": "evaluated applicable controls / total applicable controls",
+      "naming": "A governance coverage metric. It is NOT a certified regulatory compliance score."
+    }
+  },
+  "limitations": [
+    "This is an academic prototype. It is not a certified EU AI Act, NIST AI RMF or ISO/IEC 42001 conformity assessment, and passing these gates has no regulatory standing.",
+    "Thresholds in this file are configured research values chosen for demonstration. They are not derived from any standard, regulation or empirical calibration.",
+    "No digital signatures are implemented. Evidence integrity is SHA-256 change detection only, with no signing key, no certificate and no non-repudiation.",
+    "Gate results describe the evidence supplied for one audit run at one point in time. They say nothing about future behaviour of the model.",
+    "Fairness screening covers only the sensitive attributes the user selected, and only the pairwise group comparisons described. Intersectional and unmeasured disparities are outside its reach."
+  ]
+}

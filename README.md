@@ -1,19 +1,32 @@
-# AI Governance Platform — Adult / Census Income
+# MAAT — Multi-Agent AI Audit and Trust Framework
 
-An end-to-end, **locally runnable AI governance platform** built around a single real
-machine-learning model. It does not just train a classifier; it audits one — for
-performance, fairness and explainability — then records a formal governance
-decision, exposes all of it through an API, a dashboard and a deterministic agent
-layer, and finally seals the evidence with cryptographic checksums in an audit
-registry.
+An end-to-end, **locally runnable AI governance platform**: it audits a machine-learning
+model for performance, fairness and explainability, records a formal governance
+decision, evaluates that evidence against a versioned machine-readable policy through
+five governance gates, and seals every artefact with cryptographic checksums in an
+audit registry. All of it is exposed through an API, a dashboard and a deterministic
+agent layer.
 
-The model under audit predicts whether a person's annual income exceeds **\$50,000**
-from the **UCI Adult / Census Income** dataset (`id=2`), a 1994 US Census extract.
-That model exists **to be governed, not deployed** — and the platform's conclusion,
-reached from its own evidence, is that it must never be used for a real decision.
+MAAT holds two kinds of audit, and keeps them apart on purpose:
+
+- **The built-in reference case** — a real model predicting whether a person's annual
+  income exceeds **\$50,000**, from the **UCI Adult / Census Income** dataset (`id=2`),
+  a 1994 US Census extract. That model exists **to be governed, not deployed**, and the
+  platform's conclusion, reached from its own evidence, is that it must never be used
+  for a real decision. Its evidence under `data/`, `models/`, `predictions/` and
+  `results/` is immutable and is never touched by anything below.
+- **User-submitted audits** — you upload a trusted local `.joblib` binary classifier
+  and a labelled CSV, and MAAT runs the same audit disciplines over it, evaluates the
+  five gates against the policy file, and assembles a Conformity Bundle with a
+  clause-to-artefact traceability matrix. Every byte it produces lands under
+  `runtime/`, which is gitignored. See **§3f**.
+
+The framework is named for the Egyptian principle of *maat* — weighing a claim against
+a standard. Everything here is decision-support evidence for a human reviewer;
+nothing in it approves a deployment.
 
 Verified end-to-end on **Windows 11 Pro · Python 3.14.6 (64-bit)** · Intel i7 · CPU only.
-**113 tests passing.**
+**207 tests passing.**
 
 ---
 
@@ -36,7 +49,7 @@ questions *begin*:
 This project answers those questions with artefacts rather than assertions, and wires
 them into software a reviewer can actually interrogate.
 
-### 0.2 The eight phases
+### 0.2 The nine phases
 
 | # | Phase | Deliverable |
 |---|---|---|
@@ -48,31 +61,44 @@ them into software a reviewer can actually interrogate.
 | **6** | Dashboard | Streamlit UI consuming only the API |
 | **7** | Agent layer | Four deterministic, rule-based governance agents + orchestrator |
 | **8** | Audit registry | SQLite registry with SHA-256 evidence integrity verification |
+| **9** | Model intake + governance gates | Upload a trusted model and labelled data; audit it, evaluate five policy gates, emit a Conformity Bundle (**§3f**) |
 
 Each phase treats the previous phases' outputs as **read-only evidence**. Nothing
 downstream ever rewrites what it audits — a property enforced by tests, not habit.
+Phase 9 extends that rule outward: a user submission cannot write anywhere except
+`runtime/`, and cannot overwrite even its own uploads.
 
 ### 0.3 Architecture at a glance
 
 ```text
    src/            →  data/ models/ predictions/ results/     ← IMMUTABLE EVIDENCE
-   (Phases 1–4)                    │
+   (Phases 1–4)                    │                            (reference case)
                                    │ read-only
               ┌────────────────────┼────────────────────┐
               ▼                    ▼                    ▼
       app/services/         app/agents/          app/registry/
       (Phase 5 API)         (Phase 7 agents)     (Phase 8 registry)
-              │                    │                    │
+              │                    │                    ▲
+              │                    │                    │ registers both run types
+              │                    │            ┌───────┴────────┐
+              │                    │            │                │
+              │                    │      app/onboarding/   app/gates/
+              │                    │      (upload, audit)   (policy, bundle)
+              │                    │            │                │
+              │                    │            ▼                ▼
+              │                    │      runtime/uploads/  runtime/audits/<id>/
+              │                    │      runtime/governance_registry.db
+              │                    │            ← THE ONLY WRITABLE TREE (gitignored)
               └──────────── HTTP (JSON) ────────────────┘
                                    ▼
                           dashboard/ (Phase 6)
-                          7 pages, reads no files
+                          10 pages, reads no files
 ```
 
-Data flows **one way only**. The API, agents and dashboard can read the evidence;
-none of them can write to it. The single component that writes anything at all is the
-Phase 8 registry, and it writes to exactly one gitignored SQLite file under
-`runtime/`.
+Data flows **one way only** out of the immutable evidence tree. The API, agents and
+dashboard can read that evidence; none of them can write to it. Everything the platform
+writes — the registry database, uploaded files, generated predictions, audit outputs,
+gate evaluations and Conformity Bundles — goes under gitignored `runtime/`.
 
 ### 0.4 Technology
 
@@ -144,6 +170,10 @@ caveats.
   estimated stand-in is ever produced.
 - **Evidence integrity is verifiable.** 34 artefacts are checksummed; the registry
   re-verifies them on demand and reports verified / missing / changed.
+- **Containment is structural, not advisory.** Every write path for a user submission
+  resolves its target and refuses to act if the result is not inside `runtime/`, so a
+  hostile filename is neutralised by where the bytes can land rather than by a
+  blocklist of names. A test hashes the whole immutable tree around each intake test.
 
 ### 0.8 Quick start
 
@@ -176,11 +206,16 @@ streamlit run streamlit_app.py
 | Swagger API docs | **http://127.0.0.1:8000/docs** |
 
 Phase 4 needs no command — the model card, risk register and decision record are
-committed documents under `results/governance/`.
+committed documents under `results/governance/`. Phase 9 needs no command either: with
+the API and dashboard running, open **New Model Audit** in the sidebar and submit a
+model. The full intake workflow, including the API-only route, is in **§3f**.
 
-Full test suite: `pytest -q` → **113 passed** (30 API · 28 agents · 22 registry ·
-22 dashboard · 11 deployment). The dashboard tests need the API running and skip
-cleanly otherwise; the deployment tests need no server at all.
+Full test suite: `pytest -q` → **207 passed** (30 API · 28 agents · 22 registry ·
+22 dashboard · 11 deployment · 57 model intake · 37 policy gates). The dashboard tests
+need the API running and skip cleanly otherwise; the deployment tests need no server at
+all. The intake and gate tests build their own models in-process with scikit-learn, so
+no model file is committed and no upload in the suite originates outside the test
+process.
 
 ### 0.9 Document map
 
@@ -192,6 +227,7 @@ cleanly otherwise; the deployment tests need no server at all.
 | §3c | Phase 7 — agents, architecture diagram, hard constraints |
 | §3d | Phase 8 — registry, idempotency, integrity semantics |
 | §3e | **Deploying to Streamlit Community Cloud** (single-process entry point) |
+| §3f | **Phase 9 — MAAT model intake, policy gates, Conformity Bundle** (upload workflow, `.joblib` safety, gate semantics, traceability, limitations) |
 | §4–§5 | Results table and full methodology |
 | §6–§7 | Assumptions, deliberate non-choices, troubleshooting |
 
@@ -251,20 +287,38 @@ project_KMIT/
 │   │   ├── performance_agent.py  fairness_agent.py
 │   │   ├── explainability_agent.py  risk_agent.py
 │   │   ├── orchestrator.py  schemas.py
-│   └── registry/                        # Phase 8 — audit registry
-│       ├── integrity.py                 # SHA-256 discovery + verification
-│       ├── db.py                        # SQLite (the only writer)
-│       ├── service.py  schemas.py  cli.py
+│   ├── registry/                        # Phase 8 — audit registry
+│   │   ├── integrity.py                 # SHA-256 discovery + verification
+│   │   ├── db.py                        # SQLite (the only registry writer)
+│   │   ├── service.py  schemas.py  cli.py
+│   ├── onboarding/                      # Phase 9 — model intake
+│   │   ├── security.py                  # extension/size checks, joblib warning, ack
+│   │   ├── runtime_store.py             # every write path; refuses to leave runtime/
+│   │   ├── model_loader.py              # trusted joblib load + capability probe
+│   │   ├── dataset_loader.py            # CSV validation, target/sensitive columns
+│   │   ├── audit_service.py             # performance, fairness, explainability, risk
+│   │   └── schemas.py
+│   ├── gates/                           # Phase 9 — governance-as-code
+│   │   ├── policies/
+│   │   │   └── research_governance_policy_v1.json   # the policy, versioned
+│   │   ├── policy_engine.py             # deterministic control evaluation
+│   │   ├── service.py                   # gates, waivers, bundle, traceability
+│   │   └── schemas.py
 │   └── embedded.py                      # runs the API in-process (deployment)
-├── dashboard/                           # Phase 6 — Streamlit UI (7 pages)
+├── dashboard/                           # Phase 6 + 9 — Streamlit UI (10 pages)
 │   ├── streamlit_app.py
 │   └── api_client.py                    # HTTP only; reads no files
-├── tests/                               # 102 tests
+├── tests/                               # 207 tests
+│   ├── conftest.py                      # builds trusted models in-process
 │   ├── test_api.py  test_agents.py
 │   ├── test_registry.py  test_dashboard.py
-│   └── test_deployment.py               # single-process deploy path
-├── runtime/                             # gitignored local state
-│   └── governance_registry.db           # rebuild: python -m app.registry.cli register
+│   ├── test_deployment.py               # single-process deploy path
+│   ├── test_onboarding.py               # Phase 9 intake (57)
+│   └── test_gates.py                    # Phase 9 gates + bundle (37)
+├── runtime/                             # gitignored — the ONLY writable tree
+│   ├── governance_registry.db           # rebuild: python -m app.registry.cli register
+│   ├── uploads/<upload_id>/             # accepted submissions, never overwritten
+│   └── audits/<audit_run_id>/           # predictions, audit JSON, gates, bundle
 ├── streamlit_app.py                     # Cloud entry point: API in-process + dashboard
 ├── .python-version                      # pins 3.13 for Streamlit Cloud
 ├── requirements.txt
@@ -516,6 +570,13 @@ If you move the API, update **API base URL** in the dashboard sidebar to match
 A **Data provenance and limitations** section appears at the bottom of every
 page, populated from the model card via the API.
 
+Four more pages arrive with later phases: **Agent Review** (§3c), **Model Registry**
+(§3d), and the three model-intake pages — **New Model Audit**, **Uploaded Audit Runs**
+and **Policy Gates & Conformity Bundle** (§3f). Ten in total. Every one of them reads
+through the API only: the dashboard opens no file, no database, no CSV and no model,
+which is why the intake pages can display uploaded-run evidence without ever touching
+`runtime/` themselves.
+
 ### Sidebar
 
 - **Page** — navigation
@@ -720,7 +781,14 @@ decision stored on a run is a copy of the committed decision record.
 runtime/governance_registry.db      # gitignored local state
 ```
 
-Rebuild it at any time from the committed evidence — nothing is lost by deleting it.
+Rebuild the reference-case row at any time from the committed evidence — nothing is
+lost by deleting the database. Uploaded audit runs (§3f) are registered in the same
+file under `run_type = 'uploaded_model'`, and are scoped apart from the reference case
+at every point that could let one affect the other: `active_run_id` always means the
+active *reference-case* run, so registering any number of uploads never moves it and
+neither kind of run supersedes the other. Deleting the database does discard the
+registry rows for uploaded runs; their evidence under `runtime/audits/` survives, but
+the registry index of it does not.
 
 ### Create or refresh the registry (Windows)
 
@@ -814,6 +882,8 @@ the API surface stays read-only. Before the registry exists these endpoints retu
 
 Open **http://localhost:8501** → **Model Registry** for the run list, selected-run
 metadata, recorded decision, evidence coverage, live integrity status and timeline.
+That page is scoped to reference-case runs and reports how many uploaded runs exist;
+the uploaded runs themselves live on **Uploaded Audit Runs** (§3f).
 
 ### Test
 
@@ -958,7 +1028,323 @@ pytest tests\test_deployment.py -q
 11 tests, and notably they need **no externally running server** — which is the
 whole point, since Cloud has none. They cover the embedded API start, idempotency,
 loopback binding, registry bootstrap and failure tolerance, the Python pin, and an
-end-to-end render of all seven pages against the in-process API.
+end-to-end render of all ten pages against the in-process API.
+
+---
+
+## 3f. MAAT model intake and policy gates (Phase 9)
+
+Everything up to §3e audits **one** model: the committed Adult Income reference case.
+Phase 9 makes the platform interactive — you submit your own trusted local model and
+labelled data, and MAAT runs the same audit disciplines over it, evaluates five
+governance gates against a versioned policy file, and assembles a Conformity Bundle
+with a control-to-artefact traceability matrix.
+
+### The reference case and uploaded audits never mix
+
+| | Reference case | Uploaded audits |
+|---|---|---|
+| Evidence lives in | `data/ models/ predictions/ results/` (committed, immutable) | `runtime/` only (gitignored) |
+| Registry `run_type` | `reference_case` | `uploaded_model` |
+| Governance decision | The committed record: ✅ research/education only · ⛔ blocked from real-world deployment | Computed per run; deployment is **never** authorised |
+| Evaluated by the gate policy | **No** — its decision was reached separately and is unchanged | Yes |
+| Dashboard pages | Overview · Model Performance · Fairness Audit · Explainability · Governance Decision & Risks · Agent Review · Model Registry | New Model Audit · Uploaded Audit Runs · Policy Gates & Conformity Bundle |
+
+Registering an uploaded audit never moves `active_run_id`, never supersedes the
+reference run, and never writes to the immutable tree. The Model Registry page is
+scoped to reference-case runs for the same reason: the evidence you came there to read
+must not depend on who uploaded what today. A test hashes every file under the four
+immutable directories before and after each intake test and fails if a single byte,
+or a single new file, appears.
+
+### What you can upload
+
+| | Accepted | Rejected before any bytes are read |
+|---|---|---|
+| Model | exactly one `.joblib`, ≤ 200 MiB, a **fitted binary** classifier exposing `predict(X)` | `.py .pyc .pkl .pickle .dill .cloudpickle .zip .tar .gz .7z .exe .dll .so .bat .ps1 .sh .js .jar .h5 .pt .onnx .pmml .bin`, and any remote URL |
+| Dataset | exactly one `.csv`, ≤ 50 MiB, 20–200,000 rows, unique column names, containing the target column | anything else |
+
+There is no URL input anywhere in the intake path: files arrive as multipart uploads
+or not at all. A stored file is never overwritten — each submission gets its own
+`runtime/uploads/<upload_id>/` directory, and a filename is reduced to a safe label
+before it is used, so a path such as `../../results/model_metrics.joblib` becomes
+`model_metrics.joblib` inside that directory and cannot escape it.
+
+### ⚠️ Trusted local models only
+
+> **Joblib files may execute arbitrary code. Upload only models from trusted sources.
+> This local academic prototype must not accept untrusted model files in production.**
+
+This warning is shown verbatim on the New Model Audit page, and the submission is
+**refused** unless you explicitly acknowledge it — `security_acknowledged` must be
+`true`, and it is required again for every run even when reusing a previously
+validated `upload_id`, so the acknowledgement is evidenced for the run that actually
+loaded the file. Until then, nothing is deserialised.
+
+**Production hardening this prototype does not do.** A production implementation must
+not deserialise user-supplied pickles in the application process. It should run model
+loading and inference inside an isolated sandbox — a separate container or VM, no
+network egress, read-only filesystem, dropped privileges, CPU/memory limits — and
+prefer formats that do not carry executable payloads: **ONNX** for the computation
+graph, or **skops**, which reconstructs scikit-learn estimators from an allow-list of
+types instead of executing arbitrary opcodes. MAAT loads the uploaded model in-process,
+which is acceptable only because the operator is also the person supplying the file.
+
+### What you supply
+
+| Field | Required | Meaning |
+|---|---|---|
+| `model_file` | yes¹ | the trusted local `.joblib` |
+| `dataset_file` | yes¹ | the labelled `.csv` |
+| `target_column` | yes | ground-truth label column in the CSV |
+| `positive_class` | yes | which target value counts as positive |
+| `model_name` | yes | name recorded in the run's evidence |
+| `intended_use` | yes | what the model is for |
+| `decision_context` | yes | who or what its decisions affect |
+| `security_acknowledged` | yes | must be `true` — see the warning above |
+| `model_version`, `model_owner` | no | version, and the named human accountable |
+| `decision_threshold` | no | probability cut-off, default `0.5`; ignored when the model has no `predict_proba` |
+| `sensitive_columns` | no | JSON array or comma-separated names for fairness screening. **Blank means none selected** |
+| `policy_profile_id` | no | defaults to `research_governance_policy_v1` |
+
+¹ Or supply `upload_id` from a previous `POST /api/onboarding/validate` instead of
+re-sending the files.
+
+Validation refuses, with the exact field named and a hint: a missing or duplicated
+target column, a target that is not binary, a `positive_class` absent from the column,
+sensitive columns that do not exist, a model whose expected features are missing from
+the CSV (the report names which features), an object with no `predict`, and a dataset
+outside the row bounds. Two conditions are reported as **warnings** rather than
+refusals, because the audit is still meaningful without them: no `predict_proba` (so
+ROC-AUC is `NOT_EVALUATED`, no probability is synthesised, and the decision threshold
+is not applied), and no supported global explainability (reported as unavailable — no
+importance score is invented).
+
+### Run it — Windows, exact commands
+
+Two PowerShell windows, exactly as in §3b:
+
+```powershell
+# Window 1 — API
+cd C:\Users\nreddy\Downloads\project_KMIT
+.\.venv\Scripts\Activate.ps1
+uvicorn app.main:app --reload --port 8000
+```
+
+```powershell
+# Window 2 — dashboard
+cd C:\Users\nreddy\Downloads\project_KMIT
+.\.venv\Scripts\Activate.ps1
+streamlit run dashboard\streamlit_app.py
+```
+
+Then, at **http://localhost:8501**:
+
+1. **New Model Audit** → read the `.joblib` warning and tick the acknowledgement.
+2. Choose your `.joblib` and your `.csv`.
+3. Pick the target column and positive class; optionally set the decision threshold
+   and select sensitive columns for fairness screening.
+4. Fill in model name, intended use and decision context.
+5. **Validate** (optional — checks everything and stores the upload without auditing),
+   then **Run governance audit**.
+6. **Uploaded Audit Runs** → performance, fairness, explainability, risk, evidence
+   integrity and the run timeline.
+7. **Policy Gates & Conformity Bundle** → the five gates, the traceability matrix, the
+   bundle, and waiver recording.
+
+The same workflow over the API only, no dashboard:
+
+```powershell
+# Validate and audit in one call (PowerShell 7+ / curl.exe)
+curl.exe -X POST http://127.0.0.1:8000/api/onboarding/audits `
+  -F "model_file=@C:\path\to\your_model.joblib" `
+  -F "dataset_file=@C:\path\to\your_data.csv" `
+  -F "target_column=income" `
+  -F "positive_class=>50K" `
+  -F "decision_threshold=0.5" `
+  -F "sensitive_columns=[\"sex\"]" `
+  -F "security_acknowledged=true" `
+  -F "model_name=my-model" `
+  -F "model_version=1.0.0" `
+  -F "model_owner=Your Name" `
+  -F "intended_use=Research only." `
+  -F "decision_context=Synthetic data; no real decisions."
+```
+
+The response carries `audit_run_id`. Then:
+
+```powershell
+$id = "audit-xxxxxxxxxxxxxxxx"
+curl.exe http://127.0.0.1:8000/api/onboarding/audits/$id
+curl.exe http://127.0.0.1:8000/api/onboarding/audits/$id/performance
+curl.exe http://127.0.0.1:8000/api/onboarding/audits/$id/fairness
+curl.exe http://127.0.0.1:8000/api/onboarding/audits/$id/explainability
+curl.exe http://127.0.0.1:8000/api/onboarding/audits/$id/integrity
+curl.exe http://127.0.0.1:8000/api/gates/runs/$id/evaluation
+curl.exe http://127.0.0.1:8000/api/gates/runs/$id/bundle
+curl.exe http://127.0.0.1:8000/api/gates/runs/$id/traceability
+```
+
+### Endpoints (Phase 9)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/onboarding/validate` | Validate and store a submission **without** auditing it |
+| `POST` | `/api/onboarding/audits` | Create a governance audit run |
+| `GET` | `/api/onboarding/audits` | List uploaded-model audit runs |
+| `GET` | `/api/onboarding/audits/{id}` | Full detail for one run |
+| `GET` | `/api/onboarding/audits/{id}/performance` | Confusion matrix and metrics |
+| `GET` | `/api/onboarding/audits/{id}/fairness` | Group rates, disparate impact screening |
+| `GET` | `/api/onboarding/audits/{id}/explainability` | Global importance, or an explicit unavailable |
+| `GET` | `/api/onboarding/audits/{id}/governance` | Risk summary and governance state |
+| `GET` | `/api/onboarding/audits/{id}/integrity` | Re-verify the run's own evidence checksums |
+| `GET` | `/api/onboarding/audits/{id}/timeline` | Chronological history of the run |
+| `GET` | `/api/gates/policies` | The versioned policy profiles, with thresholds |
+| `GET` | `/api/gates/runs/{id}/evaluation` | The five gates and every control result |
+| `POST` | `/api/gates/runs/{id}/evaluate` | Re-evaluate (deterministic: same evidence → same result) |
+| `GET` | `/api/gates/runs/{id}/bundle` | The Conformity Bundle |
+| `GET` | `/api/gates/runs/{id}/traceability` | Control-to-artefact traceability matrix |
+| `GET` | `/api/gates/runs/{id}/waivers` | Waivers recorded against the run |
+| `POST` | `/api/gates/runs/{id}/waivers` | Record an explicit, time-bounded waiver |
+| `POST` | `/api/gates/runs/{id}/waivers/{waiver_id}/revoke` | Revoke a waiver |
+
+An unknown run id is a **404** on every one of these, including the waiver list — an
+empty list there would be indistinguishable from "this run has no waivers", which is
+the one reading a governance reviewer must not be given.
+
+### What a run writes
+
+Everything lands in `runtime/audits/<audit_run_id>/`:
+
+```text
+predictions.csv                  row-level actual/predicted labels (+ probability, if any)
+performance.json                 confusion matrix and metrics, computed from predictions.csv
+fairness.json                    group rates and disparate impact, for selected columns only
+explainability.json              permutation importance, or an explicit unavailable
+risk_summary.json                deterministic risk findings
+governance_summary.json          governance state and the run's own limitations
+uploaded_model_metadata.json     model checksum, declared identity, acknowledgement record
+uploaded_dataset_metadata.json   dataset checksum, shape, target, decision context
+gate_evaluation.json             the five gates and every control result
+conformity_bundle.json           the bundle: evidence index, disclaimers, coverage
+traceability.json                control → artefact → checksum matrix
+evidence_manifest.json           the sealed checksum baseline for the run
+manifest.json                    run index
+```
+
+### The five gates
+
+Defined in [`app/gates/policies/research_governance_policy_v1.json`](app/gates/policies/research_governance_policy_v1.json)
+— changing a threshold means editing that file and bumping its version, not editing
+the engine. The policy's own SHA-256 is reported with every evaluation.
+
+| Gate | Controls | Requirement |
+|---|---|---|
+| **DG** Data Gate | DG-01 provenance · DG-02 evidence integrity | dataset identified by checksum with shape, target and decision context; the stored file still hashes to its upload-time checksum |
+| **TG** Training Gate | TG-01 model identity · TG-02 feature compatibility | model identified by checksum with declared owner and captured acknowledgement; every feature the model expects is present |
+| **VG** Validation Gate | VG-01 performance · VG-02 fairness · VG-03 explainability | **ROC-AUC ≥ 0.85** where probabilities exist · **F1 ≥ 0.65** · **minimum disparate impact ratio ≥ 0.80** where sensitive columns were supplied · global importance where the model type supports it |
+| **RG** Release Gate | RG-01 human authorisation · RG-02 risk visibility | a named human's explicit release authorisation — which this prototype holds no record of and provides no way to create |
+| **OG** Operations Gate | OG-01 monitoring · OG-02 rollback and incident readiness | monitoring, rollback and incident response for live use — out of scope here |
+
+**Release and Operations can never pass.** They are excluded from the passing branch of
+the gate rule entirely: they can only be `BLOCK` or `NOT_EVALUATED`, no computation in
+this platform can satisfy them, and every evaluation reports
+`deployment_authorisation: not_granted`. MAAT never states that an uploaded model is
+production-ready.
+
+| Status | Meaning |
+|---|---|
+| **PASS** | The control's evidence was present and met the configured policy requirement. |
+| **WAIVE** | The control was not met, and an explicit, time-bounded, human-created waiver is currently in force. A waiver records an **accepted risk**; it does not make the requirement met. |
+| **BLOCK** | The control's evidence was present and did **not** meet the requirement. |
+| **NOT_EVALUATED** | The control was not assessed, because the evidence it needs does not exist in this prototype or was not supplied. **Neither a pass nor a failure.** |
+
+Evaluation is deterministic: identical evidence plus identical policy version yields an
+identical result, and re-evaluating reports `changed: false`. Nothing samples, learns or
+varies between runs.
+
+### Waivers
+
+- **Never automatic.** The platform never creates a waiver and never approves one. Every
+  waiver is an explicit human action carrying `control_id`, `owner`, `expires_at`,
+  `rationale` and `compensating_controls`; a missing field is a refusal.
+- **Time-bounded.** An expiry is mandatory, must parse, and must be in the future. An
+  expired waiver has no effect and the control reverts to `BLOCK`.
+- **Cannot buy a release.** Only `VG-01`, `VG-02` and `VG-03` are waiver-eligible.
+  `RG-01`, `RG-02`, `OG-01` and `OG-02` refuse with `control_not_waiver_eligible`, so no
+  waiver can override the Release Gate. Waiving every VG control still leaves
+  `deployment_authorisation: not_granted`.
+- **Runtime-only.** Waiver events live solely in `runtime/governance_registry.db`. They
+  are never written into the immutable evidence tree.
+- **None exist for the reference case.** It is explicitly out of the policy's scope, and
+  a test asserts that no waiver marker appears anywhere in the committed evidence.
+- Revoking a waiver **retains the row** (with `revoked_at`) and reverts the control. The
+  register is a history, not a current-state cache.
+
+### Conformity Bundle and traceability
+
+The bundle indexes every piece of evidence behind a run — each entry a `runtime/` path
+with its SHA-256 and a `verified / changed / missing / not_applicable` status — plus the
+gate results, coverage metrics and the disclaimers below. Its `bundle_id` is derived
+from the evidence checksums and the policy checksum, so the **same evidence and policy
+produce the same id**, and altering any cited artefact changes it.
+
+The traceability matrix maps each control to the artefact that evidences it, with the
+expected and actual checksum of **that artefact**, so a reviewer who hashes the cited
+path gets the value the row shows. Where a control's subject is a different file (DG-02
+cites the record holding the upload-time checksum, and reports the dataset's own hashes
+under `observed`), the row says so rather than putting one file's hashes in another
+file's columns. `unresolved_evidence` lists anything the matrix could not resolve.
+
+**Coverage metrics** — `evidence_coverage_score` and `control_coverage_score` — are
+**governance coverage metrics**, not certified regulatory compliance scores. Coverage
+describes how much of the policy could be assessed with the evidence supplied. It is
+not a compliance percentage and confers no certification.
+
+**No digital signatures are implemented.** Evidence integrity is SHA-256 change
+detection only: no signing key, no certificate, no non-repudiation. The bundle's
+`signature` field is `null` and says so.
+
+### What Phase 9 does not claim
+
+- **Not a certified compliance system.** MAAT is an academic prototype. It is **not** a
+  certified EU AI Act, NIST AI RMF or ISO/IEC 42001 conformity assessment, and passing
+  these gates has no regulatory standing.
+- **No legal conclusion, in either direction.** No gate result is a statement of legal
+  compliance or of legal violation.
+- **No proof of discrimination.** The four-fifths threshold is a screening heuristic. It
+  is not a legal conclusion and does not prove discrimination or causation.
+- **No causal claim.** Permutation importance describes association between an input and
+  a fitted model's output on one dataset. It is not a causal mechanism.
+- **No deployment approval.** No combination of gate results authorises deployment.
+- **No fairness claim without sensitive columns.** Select none and fairness is reported
+  as `not_provided_by_user` — not a pass, not a fail, not a fairness claim. Undefined
+  denominators are returned as `null`, never converted to zero.
+- **Provenance is as declared.** MAAT verifies that a declaration exists and that the
+  file has not changed since upload. It cannot verify that the declaration is true, that
+  the data was lawfully collected, or how the model was trained.
+- **One dataset, one moment.** Results describe the evidence supplied for one run at one
+  point in time and say nothing about future behaviour.
+
+All Phase 9 outputs are **deterministic decision-support evidence for human governance
+review**.
+
+### Tests
+
+```powershell
+pytest tests\test_onboarding.py tests\test_gates.py -q
+```
+
+94 tests: 57 intake, 37 gates. They cover refused file types and refused acknowledgement,
+every validation refusal, a full end-to-end audit of a trusted temporary scikit-learn
+pipeline, that served performance matches the run's own `predictions.csv` exactly, that
+fairness covers only selected columns, that undefined denominators are not zero, that
+unsupported explainability is reported as unavailable, deterministic gate evaluation,
+that Release and Operations never pass, waiver schema validation and the refusals above,
+bundle-id stability and its change under deliberate tampering with a runtime artefact,
+that every traceability path and checksum resolves on disk, that the reference case's
+endpoints and decision are unchanged, and that nothing appears under `data/`, `models/`,
+`predictions/` or `results/`.
 
 ---
 

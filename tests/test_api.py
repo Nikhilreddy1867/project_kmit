@@ -75,7 +75,7 @@ def test_health_reports_every_declared_artifact(client: TestClient) -> None:
 def test_openapi_and_docs_available(client: TestClient) -> None:
     assert client.get("/docs").status_code == 200
     spec = client.get("/openapi.json").json()
-    assert spec["info"]["title"] == "AI Governance Platform API"
+    assert spec["info"]["title"] == "MAAT -- Multi-Agent AI Audit and Trust Framework API"
     for route in (
         "/health",
         "/api/models",

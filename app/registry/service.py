@@ -18,6 +18,16 @@ plus the dataset and subject-model identity. Therefore:
 
 The registry records evidence. It does not evaluate or alter the governance
 decision -- the decision is copied from the committed record.
+
+Two kinds of run
+---------------
+:func:`register_run` registers the built-in Adult Income evidence as a
+``reference_case`` run. :func:`register_uploaded_run` indexes a completed
+user-submitted audit from ``runtime/audits/<audit_run_id>/`` as an ``uploaded_model``
+run. They share the storage and the integrity machinery but are otherwise isolated:
+superseding is scoped by run type, so no number of uploads can demote, alter or
+outrank the reference case, and ``active_run_id`` continues to mean the active
+reference run.
 """
 
 from __future__ import annotations
@@ -235,10 +245,14 @@ def register_run(
         ).fetchone()
 
         if existing is None:
-            # New evidence state -> new run. Demote any other active run.
+            # New evidence state -> new run. Demote any other active run -- but only
+            # among reference-case runs. Uploaded-model runs describe entirely
+            # different evidence and are not competing versions of this one, so
+            # re-registering the reference case must leave them exactly as they are.
             for row in connection.execute(
-                "SELECT run_id FROM audit_runs WHERE status = ? AND run_id != ?",
-                (registry_db.STATUS_ACTIVE, run_id),
+                "SELECT run_id FROM audit_runs "
+                "WHERE status = ? AND run_type = ? AND run_id != ?",
+                (registry_db.STATUS_ACTIVE, registry_db.RUN_TYPE_REFERENCE, run_id),
             ).fetchall():
                 superseded.append(row["run_id"])
             for old in superseded:
@@ -261,8 +275,8 @@ def register_run(
                     model_name, model_version, model_run_identifier,
                     evidence_digest, artifact_count,
                     performance_summary, governance_decision, blocking_risk_ids,
-                    audit_coverage, status
-                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    audit_coverage, status, run_type
+                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -282,6 +296,7 @@ def register_run(
                     registry_db.dumps(blocking),
                     registry_db.dumps(coverage),
                     registry_db.STATUS_ACTIVE,
+                    registry_db.RUN_TYPE_REFERENCE,
                 ),
             )
             registry_db.record_event(
@@ -344,6 +359,7 @@ def register_run(
 
     return {
         "run_id": run_id,
+        "run_type": registry_db.RUN_TYPE_REFERENCE,
         "action": action,
         "created_at": created_at,
         "refreshed_at": now,
@@ -367,6 +383,329 @@ def _rel_db(path: Path) -> str:
         return path.resolve().relative_to(PROJECT_ROOT).as_posix()
     except ValueError:
         return str(path)
+
+
+# --------------------------------------------------------------------------- #
+# Registration of uploaded-model runs
+# --------------------------------------------------------------------------- #
+#: Governance decision text stored for every uploaded run. Fixed, not computed: no
+#: measurement on an uploaded model can turn into a deployment authorisation, so
+#: there is no code path that could vary this value.
+UPLOADED_DEPLOYMENT_POSITION = (
+    "blocked -- not authorised for real-world deployment by this platform"
+)
+
+
+def _uploaded_artifact_records(manifest: dict[str, Any]) -> list[ArtifactRecord]:
+    """
+    Build the artefact manifest for an uploaded run from what is on disk now.
+
+    Sources, in order: the twelve artefacts listed in the run manifest, then
+    ``manifest.json`` itself (which cannot record its own checksum, so the registry
+    hashes it here), then the two upload source files named by the evidence manifest.
+    Every checksum is recomputed from the bytes rather than copied from the run's own
+    JSON -- the registry's baseline has to be an independent measurement, otherwise
+    verifying it later would only confirm that a file agrees with itself.
+    """
+    from app.onboarding import runtime_store as store
+
+    audit_run_id = str(manifest["audit_run_id"])
+    directory = store.audit_dir(audit_run_id)
+
+    records: list[ArtifactRecord] = []
+    seen: set[str] = set()
+
+    def add(path: Path, group: str) -> None:
+        if not path.is_file():
+            return
+        record = store.checksum_record(path, group)
+        if record["path"] in seen:
+            return
+        seen.add(record["path"])
+        records.append(
+            ArtifactRecord(
+                group=record["group"],
+                path=record["path"],
+                sha256=record["sha256"],
+                size_bytes=int(record["size_bytes"]),
+                modified_utc=record["modified_utc"],
+            )
+        )
+
+    for name in store.AUDIT_ARTIFACT_NAMES:
+        add(directory / name, "audit_run")
+
+    try:
+        evidence = store.read_json(audit_run_id, "evidence_manifest.json")
+    except store.AuditArtifactMissing:
+        evidence = {}
+    for entry in evidence.get("artifacts", []):
+        if entry.get("group") != "upload_source" or not entry.get("path"):
+            continue
+        add(PROJECT_ROOT / str(entry["path"]), "upload_source")
+
+    return records
+
+
+def _uploaded_performance_summary(
+    audit_run_id: str, manifest: dict[str, Any]
+) -> dict[str, Any]:
+    """Quote the run's own ``performance.json``. Nothing is recomputed here."""
+    from app.onboarding import runtime_store as store
+
+    try:
+        performance = store.read_json(audit_run_id, "performance.json")
+    except store.AuditArtifactMissing:
+        return {"available": False, "reason": "performance.json was not written."}
+
+    cm = performance.get("confusion_matrix") or {}
+    return {
+        "model_name": str((manifest.get("model_metadata") or {}).get("model_name")),
+        "n_test": performance.get("n_samples"),
+        "decision_threshold": performance.get("decision_threshold"),
+        "threshold_applied": performance.get("threshold_applied"),
+        "positive_class": performance.get("positive_class"),
+        **{
+            key: performance.get(key)
+            for key in ("accuracy", "precision", "recall", "f1", "roc_auc")
+        },
+        **{
+            key: cm.get(key)
+            for key in (
+                "true_negatives",
+                "false_positives",
+                "false_negatives",
+                "true_positives",
+            )
+        },
+        "roc_auc_unavailable_reason": performance.get("roc_auc_unavailable_reason"),
+        "source": f"GET /api/onboarding/audits/{audit_run_id}/performance",
+    }
+
+
+def _uploaded_decision(
+    manifest: dict[str, Any], governance: dict[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
+    """
+    Record the run's governance state in the same shape as the reference decision.
+
+    ``research_use`` carries the governance state (``review_required``,
+    ``insufficient_evidence`` or ``blocked_by_policy``) so the listing endpoint can
+    render both kinds of run through one code path. ``real_world_deployment`` is
+    constant: none of those three states is an approval.
+    """
+    state = str(
+        governance.get("governance_state")
+        or manifest.get("overall_governance_state")
+        or "unknown"
+    )
+    decision = {
+        "research_use": state,
+        "real_world_deployment": UPLOADED_DEPLOYMENT_POSITION,
+        "headline": str(
+            governance.get("state_meaning")
+            or "Deterministic gate evidence for human governance review."
+        ),
+        "decision_date": manifest.get("created_at"),
+        "source": f"GET /api/onboarding/audits/{manifest.get('audit_run_id')}/governance",
+        "note": (
+            "Derived by the Governance-as-Code policy engine from this run's own "
+            "evidence. It is decision-support for a human reviewer: not a legal "
+            "compliance finding, not proof of discrimination, not a causal claim and "
+            "not a deployment authorisation."
+        ),
+    }
+    blocking = [str(c) for c in governance.get("blocking_controls") or []]
+    return decision, blocking
+
+
+def register_uploaded_run(
+    audit_run_id: str, db_path: str | Path | None = None
+) -> str:
+    """
+    Index a completed uploaded-model audit run in the registry.
+
+    Called by :func:`app.onboarding.audit_service.create_audit` once every artefact
+    has been written. The registry row is an *index and integrity baseline* over
+    evidence that already exists -- this function computes no metric and makes no
+    decision, it copies what the run recorded and hashes the files it points at.
+
+    Differences from :func:`register_run`, all deliberate:
+
+    * The registry run id **is** the audit-run id, so one identifier addresses the
+      run in ``runtime/``, in the registry, and in the Conformity Bundle.
+    * Nothing is superseded. Two uploaded runs are two different submissions, not
+      two versions of one, and neither is a newer view of the reference case.
+    * Re-registering the same audit-run id refreshes the row in place, which is what
+      makes the call safe to repeat after a re-evaluation.
+
+    Returns the registry run id.
+    """
+    from app.onboarding import runtime_store as store
+
+    if not store.audit_dir(audit_run_id).is_dir():
+        raise store.AuditRunNotFound(audit_run_id, store.list_audit_ids())
+
+    manifest = store.read_json(audit_run_id, "manifest.json")
+    try:
+        governance = store.read_json(audit_run_id, "governance_summary.json")
+    except store.AuditArtifactMissing:
+        governance = {}
+
+    model_meta = manifest.get("model_metadata") or {}
+    target = manifest.get("target_configuration") or {}
+    try:
+        dataset_meta = store.read_json(audit_run_id, "uploaded_dataset_metadata.json")
+    except store.AuditArtifactMissing:
+        dataset_meta = {}
+
+    artifacts = _uploaded_artifact_records(manifest)
+    digest = integrity_mod.evidence_digest(artifacts)
+
+    model_checksum = str(manifest.get("model_checksum") or "")
+    dataset_checksum = str(manifest.get("dataset_checksum") or "")
+    model_name = str(model_meta.get("model_name") or "uploaded model")
+    model_version = str(
+        model_meta.get("model_version")
+        or (f"sha256:{model_checksum[:16]}" if model_checksum else "unavailable")
+    )
+    model_run_identifier = (
+        f"{model_name}@sha256:{model_checksum[:16]} · "
+        f"target={target.get('target_column')} · "
+        f"positive={target.get('positive_class')} · "
+        f"threshold={manifest.get('decision_threshold')}"
+    )
+
+    dataset_name = str(
+        dataset_meta.get("original_filename_label")
+        or dataset_meta.get("stored_filename")
+        or "uploaded dataset"
+    )
+    dataset_version = (
+        f"sha256:{dataset_checksum[:16]}" if dataset_checksum else "unavailable"
+    )
+    sensitive = target.get("sensitive_columns") or []
+    dataset_context = (
+        f"User-uploaded labelled CSV: {dataset_meta.get('row_count', 'unknown')} rows, "
+        f"{dataset_meta.get('column_count', 'unknown')} columns; target "
+        f"`{target.get('target_column')}` with positive class "
+        f"`{target.get('positive_class')}`; sensitive columns selected for fairness "
+        f"reporting: {', '.join(sensitive) if sensitive else 'none'}. Provenance, "
+        "labelling quality and representativeness are asserted by the uploader and "
+        "have not been independently verified by this platform."
+    )
+
+    coverage = dict(manifest.get("audit_coverage") or {})
+    coverage["complete"] = bool(coverage) and all(
+        bool(value) for value in coverage.values()
+    )
+    performance = _uploaded_performance_summary(audit_run_id, manifest)
+    decision, blocking = _uploaded_decision(manifest, governance)
+
+    resolved_db = registry_db.resolve_db_path(db_path)
+    now = registry_db.utc_now()
+
+    with registry_db.connect(resolved_db) as connection:
+        existing = connection.execute(
+            "SELECT run_id, created_at, refresh_count FROM audit_runs WHERE run_id = ?",
+            (audit_run_id,),
+        ).fetchone()
+
+        if existing is None:
+            connection.execute(
+                """
+                INSERT INTO audit_runs (
+                    run_id, schema_version, created_at, refreshed_at, refresh_count,
+                    dataset_name, dataset_version, dataset_context,
+                    model_name, model_version, model_run_identifier,
+                    evidence_digest, artifact_count,
+                    performance_summary, governance_decision, blocking_risk_ids,
+                    audit_coverage, status, run_type
+                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    audit_run_id,
+                    registry_db.SCHEMA_VERSION,
+                    str(manifest.get("created_at") or now),
+                    now,
+                    dataset_name,
+                    dataset_version,
+                    dataset_context,
+                    model_name,
+                    model_version,
+                    model_run_identifier,
+                    digest,
+                    len(artifacts),
+                    registry_db.dumps(performance),
+                    registry_db.dumps(decision),
+                    registry_db.dumps(blocking),
+                    registry_db.dumps(coverage),
+                    registry_db.STATUS_ACTIVE,
+                    registry_db.RUN_TYPE_UPLOADED,
+                ),
+            )
+            registry_db.record_event(
+                connection,
+                audit_run_id,
+                "uploaded_run_registered",
+                f"Indexed uploaded-model audit run with {len(artifacts)} artefacts; "
+                f"evidence digest {digest[:16]}…; governance state "
+                f"{decision['research_use']}. No existing run was superseded and the "
+                "Adult Income reference case is unaffected.",
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE audit_runs
+                   SET refreshed_at = ?, refresh_count = ?, status = ?, run_type = ?,
+                       performance_summary = ?, governance_decision = ?,
+                       blocking_risk_ids = ?, audit_coverage = ?,
+                       artifact_count = ?, evidence_digest = ?
+                 WHERE run_id = ?
+                """,
+                (
+                    now,
+                    int(existing["refresh_count"]) + 1,
+                    registry_db.STATUS_ACTIVE,
+                    registry_db.RUN_TYPE_UPLOADED,
+                    registry_db.dumps(performance),
+                    registry_db.dumps(decision),
+                    registry_db.dumps(blocking),
+                    registry_db.dumps(coverage),
+                    len(artifacts),
+                    digest,
+                    audit_run_id,
+                ),
+            )
+            registry_db.record_event(
+                connection,
+                audit_run_id,
+                "uploaded_run_refreshed",
+                f"Re-indexed after re-evaluation: {len(artifacts)} artefacts, evidence "
+                f"digest {digest[:16]}…, governance state {decision['research_use']}.",
+            )
+
+        connection.execute(
+            "DELETE FROM run_artifacts WHERE run_id = ?", (audit_run_id,)
+        )
+        connection.executemany(
+            "INSERT INTO run_artifacts (run_id, artifact_group, path, sha256, "
+            "size_bytes, modified_utc) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    audit_run_id,
+                    a.group,
+                    a.path,
+                    a.sha256,
+                    a.size_bytes,
+                    a.modified_utc,
+                )
+                for a in artifacts
+            ],
+        )
+        connection.commit()
+
+    return audit_run_id
 
 
 # --------------------------------------------------------------------------- #
@@ -398,23 +737,47 @@ def _known_run_ids(connection: sqlite3.Connection) -> list[str]:
 
 
 def list_runs(
-    db_path: str | Path | None = None, status: str | None = None
+    db_path: str | Path | None = None,
+    status: str | None = None,
+    run_type: str | None = None,
 ) -> dict[str, Any]:
-    """List registered runs, newest first."""
+    """
+    List registered runs, newest first.
+
+    ``active_run_id`` deliberately means *the active reference-case run*. It is what
+    the existing dashboard and API callers use to reach the Adult Income audit, so it
+    is scoped by run type: registering any number of uploaded audits must never move
+    it. Uploaded runs are reported separately in ``uploaded_run_ids``.
+    """
     resolved = registry_db.resolve_db_path(db_path)
     with registry_db.connect(resolved, create=False) as connection:
         query = "SELECT * FROM audit_runs"
-        params: tuple = ()
+        clauses: list[str] = []
+        params: list[Any] = []
         if status:
-            query += " WHERE status = ?"
-            params = (status,)
+            clauses.append("status = ?")
+            params.append(status)
+        if run_type:
+            clauses.append("run_type = ?")
+            params.append(run_type)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY created_at DESC, run_id"
-        rows = connection.execute(query, params).fetchall()
+        rows = connection.execute(query, tuple(params)).fetchall()
 
         active = connection.execute(
-            "SELECT run_id FROM audit_runs WHERE status = ? ORDER BY created_at DESC LIMIT 1",
-            (registry_db.STATUS_ACTIVE,),
+            "SELECT run_id FROM audit_runs WHERE status = ? AND run_type = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (registry_db.STATUS_ACTIVE, registry_db.RUN_TYPE_REFERENCE),
         ).fetchone()
+        uploaded = [
+            r["run_id"]
+            for r in connection.execute(
+                "SELECT run_id FROM audit_runs WHERE run_type = ? "
+                "ORDER BY created_at DESC, run_id",
+                (registry_db.RUN_TYPE_UPLOADED,),
+            ).fetchall()
+        ]
 
     runs = []
     for row in rows:
@@ -423,6 +786,7 @@ def list_runs(
         runs.append(
             {
                 "run_id": row["run_id"],
+                "run_type": row["run_type"],
                 "status": row["status"],
                 "created_at": row["created_at"],
                 "refreshed_at": row["refreshed_at"],
@@ -442,8 +806,15 @@ def list_runs(
     return {
         "count": len(runs),
         "active_run_id": active["run_id"] if active else None,
+        "active_reference_run_id": active["run_id"] if active else None,
+        "uploaded_run_ids": uploaded,
         "database": _rel_db(resolved),
-        "filters_applied": {"status": status},
+        "filters_applied": {"status": status, "run_type": run_type},
+        "run_type_note": (
+            "'reference_case' runs describe the built-in Adult Income audit. "
+            "'uploaded_model' runs describe user submissions stored under runtime/. "
+            "The two are never versions of each other and neither supersedes the other."
+        ),
         "runs": runs,
     }
 
@@ -461,6 +832,7 @@ def get_run(run_id: str, db_path: str | Path | None = None) -> dict[str, Any]:
 
     return {
         "run_id": row["run_id"],
+        "run_type": row["run_type"],
         "schema_version": int(row["schema_version"]),
         "status": row["status"],
         "created_at": row["created_at"],
@@ -645,6 +1017,7 @@ def registry_stats(db_path: str | Path | None = None) -> dict[str, Any]:
             "superseded": 0,
             "archived": 0,
             "database": _rel_db(resolved),
+            "by_run_type": {run_type: 0 for run_type in registry_db.VALID_RUN_TYPES},
             "initialised": False,
         }
     with registry_db.connect(resolved, create=False) as connection:
@@ -654,12 +1027,22 @@ def registry_stats(db_path: str | Path | None = None) -> dict[str, Any]:
             ).fetchone()["n"]
             for status in registry_db.VALID_STATUSES
         }
+        by_run_type = {
+            run_type: int(
+                connection.execute(
+                    "SELECT COUNT(*) AS n FROM audit_runs WHERE run_type = ?",
+                    (run_type,),
+                ).fetchone()["n"]
+            )
+            for run_type in registry_db.VALID_RUN_TYPES
+        }
         total = connection.execute("SELECT COUNT(*) AS n FROM audit_runs").fetchone()["n"]
     return {
         "total_runs": int(total),
         "active": int(counts[registry_db.STATUS_ACTIVE]),
         "superseded": int(counts[registry_db.STATUS_SUPERSEDED]),
         "archived": int(counts[registry_db.STATUS_ARCHIVED]),
+        "by_run_type": by_run_type,
         "database": _rel_db(resolved),
         "initialised": True,
     }
